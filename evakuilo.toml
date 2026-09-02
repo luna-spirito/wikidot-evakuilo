@@ -1,0 +1,19 @@
+# evakuilo v2 configuration — one instance per file.
+
+data_dir = "data"
+
+# Network politeness (global across all sites, as in v1).
+timeout_s = 30
+rate_limit_ms = 2000
+
+# Periodic job intervals, seconds.
+monitor_interval_s = 1800 # RecentChanges discovery scan
+shell_interval_s = 86400  # site shell + theme refresh
+out_interval_s = 300      # out/ publication refresh
+
+# zstd level for out/ page archives.
+zstd_level = 19
+
+[instance]
+name = "kolorinko"
+sites = ["obscurative", "rpcauthority"]
