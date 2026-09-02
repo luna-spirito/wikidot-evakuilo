@@ -41,9 +41,11 @@
 //!
 //! ## Priorities
 //!
-//! Priorities decide claim order when the queue backs up (it won't, at one
-//! request per `rate_limit_ms`): discovery and page resolution first, then
-//! newest revisions, then files, then publication.
+//! Priorities are per-row (set at enqueue time, see `prio`) and decide
+//! claim order when the queue backs up. v1's invariant is preserved: a
+//! fresh recent-change never waits behind the history backlog — discovery
+//! feed first, then each page's newest revision, then slug reconciliation,
+//! then intermediate history, files, publication.
 
 use serde_json::json;
 
@@ -70,33 +72,28 @@ pub mod kind {
 }
 
 pub mod prio {
-    /// The actual payload drains first; a page.sync can always refill the
-    /// revision queue, so bookkeeping never starves the archive either —
-    /// whoever's queue is empty yields to the other.
+    /// Enqueue-time claim priorities (higher runs first), mirroring v1's
+    /// two-rate-limiter-class scheme — a fresh recent-change must never
+    /// wait behind a multi-hour backlog drain:
     ///
-    /// Resolved from the kind at claim time (SQL `kind_prio()`), so retuning
-    /// applies to already-queued rows — unlike the priority column, which is
-    /// frozen at enqueue time.
+    /// * 30 discovery feed · 20 the newest revision of a page (v1 "high")
+    /// * 10 slug reconciliation (v1: page fetches rode the high class)
+    /// *  8 intermediate revision history (v1 "low" slot)
+    /// *  0 files/theme · -5 shell · -10 publication
+    ///
+    /// Frozen on the row at enqueue time: the head/intermediate split is
+    /// inherently per-job, so a claim-time kind lookup cannot express it.
+    /// Retuning the table therefore applies to future enqueues only;
+    /// periodic jobs re-read nothing — their singleton row keeps the
+    /// priority it was seeded with.
     pub const DISCOVER: i64 = 30;
-    pub const REVISION: i64 = 20;
+    pub const REVISION_HEAD: i64 = 20;
     pub const PAGE: i64 = 10;
+    pub const REVISION_OLD: i64 = 8;
     pub const BACKFILL: i64 = 5;
     pub const FILE: i64 = 0;
     pub const SHELL: i64 = -5;
     pub const OUT: i64 = -10;
-
-    pub fn of(kind: &str) -> i64 {
-        match kind {
-            super::kind::DISCOVER => DISCOVER,
-            super::kind::REVISION_FETCH => REVISION,
-            super::kind::PAGE_SYNC => PAGE,
-            super::kind::BACKFILL => BACKFILL,
-            super::kind::FILE_FETCH | super::kind::THEME_CRAWL => FILE,
-            super::kind::SHELL_SYNC => SHELL,
-            super::kind::OUT_UPDATE => OUT,
-            _ => FILE,
-        }
-    }
 }
 
 /// Event-class kinds: no stable identity, no dedup, deleted on completion.
@@ -153,11 +150,20 @@ pub fn page_sync(slug: &str) -> NewJob {
     )
 }
 
-pub fn revision_fetch(page_id: i64, rev_no: i64, rev_id: &str) -> NewJob {
+/// One revision's wikitext. `head` marks the page's newest revision — v1's
+/// high slot: heads jump ahead of the intermediate-history backlog (and of
+/// page reconciliation), so a fresh edit lands without waiting for the
+/// catch-up grind. Intermediate revisions stay below `page.sync`, exactly
+/// like v1's low limiter class.
+pub fn revision_fetch(page_id: i64, rev_no: i64, rev_id: &str, head: bool) -> NewJob {
     NewJob::one_shot(
         kind::REVISION_FETCH,
         json!({ "page_id": page_id, "rev_no": rev_no, "rev_id": rev_id }).to_string(),
-        prio::REVISION,
+        if head {
+            prio::REVISION_HEAD
+        } else {
+            prio::REVISION_OLD
+        },
     )
 }
 
@@ -181,4 +187,23 @@ pub fn theme_crawl(roots: &[String]) -> NewJob {
     );
     j.resurrect = true;
     j
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1's freshness invariant: a page's newest revision outranks slug
+    /// reconciliation, which outranks intermediate history — a fresh edit
+    /// never waits behind the backlog drain.
+    #[test]
+    fn revision_priority_splits_head_from_history_like_v1() {
+        let head = revision_fetch(1, 9, "9", true);
+        let intermediate = revision_fetch(1, 8, "8", false);
+        let sync = page_sync("some:slug");
+        assert_eq!(head.priority, prio::REVISION_HEAD);
+        assert_eq!(intermediate.priority, prio::REVISION_OLD);
+        assert!(head.priority > sync.priority);
+        assert!(sync.priority > intermediate.priority);
+    }
 }

@@ -181,20 +181,27 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
             stats.revisions_content += n.max(1);
         }
 
-        // 3. Contentless revisions → revision.fetch backfill jobs.
+        // 3. Contentless revisions → revision.fetch backfill jobs, with the
+        //    page's newest revision marked head (v1's high/low backlog split:
+        //    the live edge drains before intermediate history).
         {
-            let mut stmt =
-                tx.prepare("SELECT page_id, rev_no, rev_id FROM revisions WHERE content IS NULL")?;
+            let mut stmt = tx.prepare(
+                "SELECT r.page_id, r.rev_no, r.rev_id,
+                        r.rev_no = (SELECT max(rev_no) FROM revisions r2
+                                    WHERE r2.page_id = r.page_id)
+                 FROM revisions r WHERE r.content IS NULL",
+            )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
                 ))
             })?;
             for row in rows {
-                let (page_id, rev_no, rev_id) = row?;
-                jobs_to_enqueue.push(jobs::revision_fetch(page_id, rev_no, &rev_id));
+                let (page_id, rev_no, rev_id, is_head) = row?;
+                jobs_to_enqueue.push(jobs::revision_fetch(page_id, rev_no, &rev_id, is_head));
                 stats.revision_jobs += 1;
             }
         }
@@ -289,12 +296,17 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
             let size = std::fs::metadata(&blob)
                 .map(|m| m.len() as i64)
                 .unwrap_or(0);
+            // No server headers survive a legacy import: recover the media
+            // type from the blob itself (magic bytes, then the row path's
+            // extension).
+            let content_type = crate::blobs::sniff_content_type_at(&dest, &path);
             tx.execute(
-                "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at)
-                 VALUES(?1,?2,?3,?4,'saved',?5,?6)
+                "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at, content_type)
+                 VALUES(?1,?2,?3,?4,'saved',?5,?6,?7)
                  ON CONFLICT(path) DO UPDATE SET
-                   sha256=excluded.sha256, size=excluded.size, status='saved'",
-                rusqlite::params![path, url, sha, size, db::now(), db::now()],
+                   sha256=excluded.sha256, size=excluded.size, status='saved',
+                   content_type=excluded.content_type",
+                rusqlite::params![path, url, sha, size, db::now(), db::now(), content_type],
             )?;
             stats.files += 1;
         }
@@ -553,8 +565,14 @@ fn sharded_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Every `r*.txt` under `_pages_by_id` (sorted for determinism).
+/// Every `r*.txt` under `_pages_by_id` (sorted for determinism). A tree
+/// with no saved page bodies at all (nothing was fetched before v1 was
+/// abandoned) has no such directory — that imports as zero content, the
+/// daemon backfills from the journals.
 fn r_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -579,8 +597,13 @@ fn r_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Every symlink under `files/` (sorted).
+/// Every symlink under `files/` (sorted). A site whose legacy tree has no
+/// `files/` view has no importable attachment mapping — imports as zero
+/// rows; the wikitext backfill re-discovers those files live.
 fn symlink_tree(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {

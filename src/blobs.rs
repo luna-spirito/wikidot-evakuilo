@@ -71,6 +71,32 @@ pub fn blob_path(out_dir: &Path, sha256: &str) -> PathBuf {
         .join(&sha256[4..])
 }
 
+/// Best-effort media type for stored bytes: magic numbers first, falling
+/// back to the file-name extension (`name` is the files-row path, which
+/// carries the original name — the blob path is a bare hash). Used wherever
+/// no server Content-Type exists (legacy import) or as a fetch fallback.
+pub fn sniff_content_type(bytes: &[u8], name: &str) -> Option<String> {
+    infer::get(bytes)
+        .map(|t| t.mime_type().to_string())
+        // The extension lives in the path; query/fragment carry none
+        // (`…/css?family=Exo+2` is still a `.css`-ish URL).
+        .or_else(|| {
+            let bare = name.split(['?', '#']).next().unwrap_or(name);
+            mime_guess::from_path(bare)
+                .first_raw()
+                .map(str::to_string)
+        })
+}
+
+/// `sniff_content_type` for an on-disk blob: reads a bounded prefix (the
+/// magic-byte matchers never need more) instead of the whole file.
+pub fn sniff_content_type_at(path: &Path, name: &str) -> Option<String> {
+    use std::io::Read;
+    let mut prefix = [0u8; 8192];
+    let n = std::fs::File::open(path).ok()?.read(&mut prefix).ok()?;
+    sniff_content_type(&prefix[..n], name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +122,41 @@ mod tests {
         // same bytes under a different out dir → same hash
         let h3 = write_blob(tempfile::tempdir().unwrap().path(), b"hello").unwrap();
         assert_eq!(h1, h3);
+    }
+
+    #[test]
+    fn sniff_prefers_magic_bytes_over_extension() {
+        // PNG bytes with a .css name: magic wins.
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
+        assert_eq!(
+            sniff_content_type(png, "local--files/x/pic.css").as_deref(),
+            Some("image/png")
+        );
+        // Text bytes: no magic match, extension decides.
+        assert_eq!(
+            sniff_content_type(b"h1 { color: red }", "theme/style.css").as_deref(),
+            Some("text/css")
+        );
+        // No magic, no extension → unknown.
+        assert_eq!(sniff_content_type(b"???", "noext"), None);
+    }
+
+    #[test]
+    fn sniff_at_reads_prefix_and_uses_row_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("abcd"); // hash-like name, no extension
+        std::fs::write(&blob, b"\x25PDF-1.7 rest of pdf").unwrap();
+        assert_eq!(
+            sniff_content_type_at(&blob, "local--files/x/doc.bin").as_deref(),
+            Some("application/pdf")
+        );
+        // CSS text under an extension-less blob name: the row path decides.
+        let css = dir.path().join("efgh");
+        std::fs::write(&css, b"@import url(x);\nbody {}").unwrap();
+        assert_eq!(
+            sniff_content_type_at(&css, "files/cdn/x/style.css").as_deref(),
+            Some("text/css")
+        );
+        assert_eq!(sniff_content_type_at(&dir.path().join("nope"), "a.png"), None);
     }
 }

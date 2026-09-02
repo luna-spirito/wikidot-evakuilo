@@ -220,14 +220,20 @@ impl<'a> SiteApi<'a> {
         Ok(parsers::extract_page_files(&body))
     }
 
-    pub async fn fetch_attachment(&self, path: &str) -> FetchResult<Vec<u8>> {
+    /// Fetch an attachment: (bytes, media type). The media type is the
+    /// server's Content-Type sans parameters, or None when it sent nothing
+    /// usable — callers fall back to sniffing.
+    pub async fn fetch_attachment(&self, path: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
         let url = format!("{}/{path}", self.base());
         self.retryable(&format!("attachment {path}"), || async {
             let resp = self.wik.get(&self.site, &url).await?;
-            resp.bytes()
+            let content_type = media_type(resp.headers());
+            let bytes = resp
+                .bytes()
                 .await
                 .map(|b| b.to_vec())
-                .map_err(|e| FetchError::Http(e.to_string()))
+                .map_err(|e| FetchError::Http(e.to_string()))?;
+            Ok((bytes, content_type))
         })
         .await
     }
@@ -235,16 +241,28 @@ impl<'a> SiteApi<'a> {
     /// Fetch a public absolute URL (theme CSS / fonts on third-party CDNs):
     /// no site cookies either direction, shared global limiter, retried on
     /// transient failures like every other fetch (Wikidot's 302→500 lesson).
-    pub async fn fetch_public(&self, url: &str) -> FetchResult<Vec<u8>> {
+    /// Returns (bytes, media type) like `fetch_attachment`.
+    pub async fn fetch_public(&self, url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
         self.retryable(&format!("public asset {url}"), || async {
             let resp = self.wik.get_public(url).await?;
-            resp.bytes()
+            let content_type = media_type(resp.headers());
+            let bytes = resp
+                .bytes()
                 .await
                 .map(|b| b.to_vec())
-                .map_err(|e| FetchError::Http(e.to_string()))
+                .map_err(|e| FetchError::Http(e.to_string()))?;
+            Ok((bytes, content_type))
         })
         .await
     }
+}
+
+/// `Content-Type` header value with its parameters stripped
+/// (`text/css; charset=utf-8` → `text/css`), or None if absent/invalid.
+fn media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers.get(reqwest::header::CONTENT_TYPE)?.to_str().ok()?;
+    let mime = raw.split(';').next()?.trim();
+    (!mime.is_empty()).then(|| mime.to_ascii_lowercase())
 }
 
 /// v1 `parse_ajax_body`: `{status, body?}`; `no_permission` → Forbidden,
@@ -263,5 +281,40 @@ fn parse_ajax_body(json: &str) -> FetchResult<String> {
         other => Err(FetchError::Parse(format!(
             "AJAX status '{other}' (expected 'ok')"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ct(value: &str) -> Option<String> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_str(value).unwrap(),
+        );
+        media_type(&headers)
+    }
+
+    #[test]
+    fn media_type_strips_parameters_and_lowercases() {
+        assert_eq!(ct("image/png").as_deref(), Some("image/png"));
+        assert_eq!(
+            ct("text/css; charset=utf-8").as_deref(),
+            Some("text/css")
+        );
+        assert_eq!(ct("Text/HTML;Charset=UTF-8").as_deref(), Some("text/html"));
+        assert_eq!(ct(""), None);
+        assert_eq!(ct("; charset=utf-8"), None);
+        // Non-ASCII header values are dropped, not propagated.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(media_type(&headers), None);
+        // Absent header → None.
+        assert_eq!(media_type(&reqwest::header::HeaderMap::new()), None);
     }
 }

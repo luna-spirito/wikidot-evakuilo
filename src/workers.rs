@@ -219,6 +219,9 @@ async fn page_sync(db: &Db, api: &SiteApi<'_>, job: &db::Job) -> Result<Outcome,
             ],
         )?;
         let mut rev_jobs = Vec::new();
+        // v1 high/low split: only the page's newest revision rides the head
+        // priority; everything older is intermediate-history backlog.
+        let head_rev = new_revs.iter().map(|r| r.rev_no).max();
         for r in &new_revs {
             tx.execute(
                 "INSERT OR IGNORE INTO revisions(page_id, rev_no, rev_id, ts, author)
@@ -230,7 +233,12 @@ async fn page_sync(db: &Db, api: &SiteApi<'_>, job: &db::Job) -> Result<Outcome,
             // row was hand-repaired; routine revival of dead fetches is the
             // periodic backfill's job (revs behind max_rev never reappear
             // in new_revs).
-            let mut j = jobs::revision_fetch(page_id, r.rev_no, &r.rev_id);
+            let mut j = jobs::revision_fetch(
+                page_id,
+                r.rev_no,
+                &r.rev_id,
+                Some(r.rev_no) == head_rev,
+            );
             j.resurrect = true;
             rev_jobs.push(j);
         }
@@ -355,7 +363,7 @@ async fn file_fetch(
         _ => {}
     }
 
-    let bytes = match api.fetch_attachment(&p.path).await {
+    let (bytes, header_type) = match api.fetch_attachment(&p.path).await {
         Ok(b) => b,
         Err(FetchError::NotFound) => {
             // Deleted upstream (v1 `failed_files`): permanent, recorded.
@@ -376,17 +384,21 @@ async fn file_fetch(
 
     let sha = blobs::write_blob(out_dir, &bytes)
         .map_err(|e| FetchError::Http(format!("blob write: {e}")))?;
+    // Server's word first; sniff when it said nothing.
+    let content_type =
+        header_type.or_else(|| blobs::sniff_content_type(&bytes, &p.path));
     let url = format!("http://{}.wikidot.com/{}", api.site, p.path);
     let path = p.path.clone();
     let size = bytes.len() as i64;
     let effects: Effects = Box::new(move |tx| {
         tx.execute(
-            "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at)
-             VALUES(?1, ?2, ?3, ?4, 'saved', ?5, ?6)
+            "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at, content_type)
+             VALUES(?1, ?2, ?3, ?4, 'saved', ?5, ?6, ?7)
              ON CONFLICT(path) DO UPDATE SET
                url=excluded.url, sha256=excluded.sha256, size=excluded.size,
-               status='saved', saved_at=excluded.saved_at",
-            params![path, url, sha, size, db::now(), db::now()],
+               status='saved', saved_at=excluded.saved_at,
+               content_type=excluded.content_type",
+            params![path, url, sha, size, db::now(), db::now(), content_type],
         )?;
         Ok(())
     });
@@ -467,8 +479,9 @@ struct ThemeMarker {
 
 // ── theme.crawl: evacuate the theme @import / url() graph ──
 
-/// One files-row upsert produced during the crawl: (path, url, sha256, size).
-type SavedRow = (String, String, String, i64);
+/// One files-row upsert produced during the crawl:
+/// (path, url, sha256, size, content_type).
+type SavedRow = (String, String, String, i64, Option<String>);
 
 async fn theme_crawl(
     db: &Db,
@@ -513,11 +526,11 @@ async fn theme_crawl(
                 };
             }
             match api.fetch_public(&url).await {
-                Ok(bytes) => {
+                Ok((bytes, content_type)) => {
                     let size = bytes.len() as i64;
                     match blobs::write_blob(out_dir, &bytes) {
                         Ok(sha) => {
-                            saved.lock().push((path, row_url, sha, size));
+                            saved.lock().push((path, row_url, sha, size, content_type));
                             match String::from_utf8(bytes) {
                                 Ok(text) => Some(crate::theme::Fetched::Css(text)),
                                 Err(_) => Some(crate::theme::Fetched::Binary),
@@ -554,11 +567,11 @@ async fn theme_crawl(
             continue;
         }
         match api.fetch_public(url).await {
-            Ok(bytes) => {
+            Ok((bytes, content_type)) => {
                 let size = bytes.len() as i64;
                 match blobs::write_blob(out_dir, &bytes) {
                     Ok(sha) => {
-                        saved.lock().push((path, row_url, sha, size));
+                        saved.lock().push((path, row_url, sha, size, content_type));
                         asset_ok += 1;
                     }
                     Err(_) => asset_failed.push(url.clone()),
@@ -602,14 +615,15 @@ async fn theme_crawl(
     let n_saved = saved_rows.len();
     let n_missing = missing_paths.len();
     let effects: Effects = Box::new(move |tx| {
-        for (path, url, sha, size) in &saved_rows {
+        for (path, url, sha, size, content_type) in &saved_rows {
             tx.execute(
-                "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at)
-                 VALUES(?1, ?2, ?3, ?4, 'saved', ?5, ?6)
+                "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at, content_type)
+                 VALUES(?1, ?2, ?3, ?4, 'saved', ?5, ?6, ?7)
                  ON CONFLICT(path) DO UPDATE SET
                    url=excluded.url, sha256=excluded.sha256, size=excluded.size,
-                   status='saved', saved_at=excluded.saved_at",
-                params![path, url, sha, size, db::now(), db::now()],
+                   status='saved', saved_at=excluded.saved_at,
+                   content_type=excluded.content_type",
+                params![path, url, sha, size, db::now(), db::now(), content_type],
             )?;
         }
         for path in &missing_paths {
@@ -676,19 +690,27 @@ fn backfill(cfg: &Config) -> Result<Outcome, FetchError> {
     let effects: Effects = Box::new(|tx| {
         let mut jobs = Vec::new();
         let mut stmt = tx.prepare(
-            "SELECT r.page_id, r.rev_no, r.rev_id FROM revisions r
+            "SELECT r.page_id, r.rev_no, r.rev_id,
+                    r.rev_no = (SELECT max(rev_no) FROM revisions r2
+                                WHERE r2.page_id = r.page_id)
+             FROM revisions r
              WHERE r.content IS NULL AND NOT EXISTS (
                SELECT 1 FROM denied_revisions d
                WHERE d.page_id = r.page_id AND d.rev_no = r.rev_no)",
         )?;
         let revs = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
-        for (page_id, rev_no, rev_id) in &revs {
-            let mut j = jobs::revision_fetch(*page_id, *rev_no, rev_id);
+        for (page_id, rev_no, rev_id, is_head) in &revs {
+            let mut j = jobs::revision_fetch(*page_id, *rev_no, rev_id, *is_head);
             j.resurrect = true;
             jobs.push(j);
         }

@@ -125,6 +125,7 @@ struct FileManifest {
     path: String,
     sha256: Option<String>,
     size: Option<i64>,
+    content_type: Option<String>,
     status: String,
     blob: Option<String>,
 }
@@ -251,6 +252,7 @@ fn write_manifests(db: &Db, site: &str, out_dir: &Path) -> Result<usize> {
                 .map(|sha| format!("files_ca/{}/{}/{}", &sha[..2], &sha[2..4], &sha[4..])),
             sha256: f.sha256,
             size: f.size,
+            content_type: f.content_type,
             status: f.status,
         })
         .collect();

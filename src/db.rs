@@ -150,7 +150,14 @@ CREATE TABLE out_state (
 );
 "#;
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const SCHEMA_V2: &str = r#"
+-- Media type of the stored bytes: the server's Content-Type (sans
+-- parameters) when a fetch supplied one, otherwise a best-effort guess from
+-- magic bytes / file-name extension (legacy import). NULL = unknown.
+ALTER TABLE files ADD COLUMN content_type TEXT;
+"#;
+
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 // ── Job types ──
 
@@ -242,19 +249,6 @@ impl Db {
         }
         conn.busy_timeout(std::time::Duration::from_secs(10))
             .context("setting busy_timeout")?;
-        // Priority is resolved from the kind at claim time (see `claim`),
-        // so retuning the table applies to already-queued jobs as well.
-        conn.create_scalar_function(
-            "kind_prio",
-            1,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let kind: String = ctx.get(0)?;
-                Ok(crate::jobs::prio::of(&kind))
-            },
-        )
-        .context("registering kind_prio()")?;
         let db = Db(Arc::new(Mutex::new(conn)));
         if !read_only {
             db.migrate().context("migrating schema")?;
@@ -340,8 +334,9 @@ impl Db {
     /// Atomically claim up to `limit` runnable jobs (pending, due, highest
     /// priority first). Claimed jobs are `running` with `attempts` bumped.
     ///
-    /// Priority is resolved from the job kind at claim time — not from the
-    /// row — so retuning the priority table applies to queued jobs too.
+    /// Priority is the row's own column, frozen at enqueue time — the v1
+    /// freshness split (head vs intermediate revisions, `jobs::prio`) is
+    /// inherently per-job and cannot be resolved from the kind alone.
     pub fn claim(&self, limit: i64) -> Result<Vec<Job>> {
         let conn = self.0.lock();
         let mut stmt = conn.prepare(
@@ -350,7 +345,7 @@ impl Db {
              WHERE id IN (
                SELECT id FROM jobs
                WHERE status='pending' AND run_at<=?2
-               ORDER BY kind_prio(kind) DESC, run_at, id
+               ORDER BY priority DESC, run_at, id
                LIMIT ?3
              )
              RETURNING id, kind, payload, priority, attempts, max_attempts, run_at",
@@ -634,17 +629,19 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Rows for `files.json`: path, hash, size, status — by path.
+    /// Rows for `files.json`: path, hash, size, status, media type — by path.
     pub fn files_manifest(&self) -> Result<Vec<FileManifestRow>> {
         let conn = self.0.lock();
-        let mut stmt =
-            conn.prepare("SELECT path, sha256, size, status FROM files ORDER BY path")?;
+        let mut stmt = conn.prepare(
+            "SELECT path, sha256, size, status, content_type FROM files ORDER BY path",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(FileManifestRow {
                 path: r.get(0)?,
                 sha256: r.get(1)?,
                 size: r.get(2)?,
                 status: r.get(3)?,
+                content_type: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -828,6 +825,7 @@ pub struct FileManifestRow {
     pub sha256: Option<String>,
     pub size: Option<i64>,
     pub status: String,
+    pub content_type: Option<String>,
 }
 
 fn parse_tags(json: &str) -> Vec<String> {
