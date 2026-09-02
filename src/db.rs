@@ -33,7 +33,7 @@
 //!   re-claims it at startup (`recover`). A crash mid-HTTP just loses the
 //!   fetch; the job is retried. Idempotent effects make both safe.
 //! * Single daemon per site DB is enforced with an flock on
-//!   `meta/daemon.lock`, so a stale `running` row really means a dead
+//!   `meta/{site}/daemon.lock`, so a stale `running` row really means a dead
 //!   process, never a concurrent one.
 
 use std::{

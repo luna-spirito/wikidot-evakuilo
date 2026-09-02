@@ -90,23 +90,21 @@ impl Config {
         Ok(cfg)
     }
 
-    /// `{data_dir}/{instance.name}` — the repo directory.
+    /// `{data_dir}/{instance.name}` — the repo directory, tier-first:
+    /// `{repo}/meta/{site}/` is private state (source-of-truth DBs, daemon
+    /// locks), `{repo}/out/{site}/` is the public publication — the whole
+    /// tree is serveable as-is.
     pub fn repo_dir(&self) -> PathBuf {
         self.data_dir.join(&self.instance.name)
     }
 
-    /// `{repo}/{site}` — one site's tree.
-    pub fn site_dir(&self, site: &str) -> PathBuf {
-        self.repo_dir().join(site)
-    }
-
-    /// `{repo}/{site}/meta/site.db` — the site's source of truth.
+    /// `{repo}/meta/{site}/site.db` — the site's source of truth.
     pub fn site_db(&self, site: &str) -> PathBuf {
-        self.site_dir(site).join("meta").join("site.db")
+        self.repo_dir().join("meta").join(site).join("site.db")
     }
 
-    /// `{repo}/{site}/out` — the site's published artifact.
+    /// `{repo}/out/{site}` — the site's published artifact.
     pub fn site_out(&self, site: &str) -> PathBuf {
-        self.site_dir(site).join("out")
+        self.repo_dir().join("out").join(site)
     }
 }
