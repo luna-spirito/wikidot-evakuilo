@@ -32,8 +32,8 @@
 //!   next `shell.sync` re-enqueues. A swallowed enqueue therefore
 //!   self-heals — no race to fix.
 //!
-//! Periodic singletons (`discover`, `shell.sync`, `out.update`) never go
-//! `done`: dedup on their constant `{}` payload is just the singleton
+//! Periodic singletons (`discover`, `shell.sync`, `out.update`, `backfill`)
+//! never go `done`: dedup on their constant `{}` payload is just the singleton
 //! guard. Their cadence is read from the live config at completion time,
 //! never from the payload — the payload is the dedup key, and embedding a
 //! tunable there would fork a second eternal copy of the job on every
@@ -64,6 +64,9 @@ pub mod kind {
     pub const SHELL_SYNC: &str = "shell.sync";
     /// Periodic out/ publication refresh (self-rescheduling).
     pub const OUT_UPDATE: &str = "out.update";
+    /// Periodic reconciliation: resurrect dead fetch jobs for content the
+    /// DB knows is missing (self-rescheduling).
+    pub const BACKFILL: &str = "backfill";
 }
 
 pub mod prio {
@@ -77,6 +80,7 @@ pub mod prio {
     pub const DISCOVER: i64 = 30;
     pub const REVISION: i64 = 20;
     pub const PAGE: i64 = 10;
+    pub const BACKFILL: i64 = 5;
     pub const FILE: i64 = 0;
     pub const SHELL: i64 = -5;
     pub const OUT: i64 = -10;
@@ -86,6 +90,7 @@ pub mod prio {
             super::kind::DISCOVER => DISCOVER,
             super::kind::REVISION_FETCH => REVISION,
             super::kind::PAGE_SYNC => PAGE,
+            super::kind::BACKFILL => BACKFILL,
             super::kind::FILE_FETCH | super::kind::THEME_CRAWL => FILE,
             super::kind::SHELL_SYNC => SHELL,
             super::kind::OUT_UPDATE => OUT,
@@ -134,6 +139,7 @@ pub fn seed_periodic() -> Vec<NewJob> {
         periodic(kind::DISCOVER, prio::DISCOVER),
         periodic(kind::SHELL_SYNC, prio::SHELL),
         periodic(kind::OUT_UPDATE, prio::OUT),
+        periodic(kind::BACKFILL, prio::BACKFILL),
     ]
 }
 

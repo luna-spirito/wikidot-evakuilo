@@ -88,12 +88,22 @@ fn rev_entry_name(rev_no: i64) -> String {
     format!("r{rev_no:0>3}.txt")
 }
 
+/// `pages_by_id` sharding: 2/2/rest of a zero-padded page id. Real Wikidot
+/// ids are 7+ digits — the padding only keeps pathological short ids from
+/// panicking on slicing, and gives the archive writer and the manifest
+/// builder one shared shape so they can never disagree.
+fn page_id_shards(page_id: &str) -> (String, String, String) {
+    let padded = format!("{page_id:0>5}");
+    (
+        padded[..2].to_string(),
+        padded[2..4].to_string(),
+        padded[4..].to_string(),
+    )
+}
+
 pub fn page_archive_path(out_dir: &Path, page_id: &str) -> PathBuf {
-    out_dir
-        .join("pages_by_id")
-        .join(&page_id[..2])
-        .join(&page_id[2..4])
-        .join(format!("{}.zst", &page_id[4..]))
+    let (a, b, rest) = page_id_shards(page_id);
+    out_dir.join("pages_by_id").join(a).join(b).join(format!("{rest}.zst"))
 }
 
 #[derive(Serialize)]
@@ -202,6 +212,9 @@ fn write_page_archive(
     }
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    if let Some(parent) = dest.parent() {
+        crate::blobs::sync_dir(parent).context("fsync archive dir")?;
+    }
     Ok(())
 }
 
@@ -214,13 +227,9 @@ fn write_manifests(db: &Db, site: &str, out_dir: &Path) -> Result<usize> {
         .into_iter()
         .map(|p| {
             let id = p.id_str();
+            let (a, b, rest) = page_id_shards(&id);
             PageManifest {
-                archive: format!(
-                    "pages_by_id/{}/{}/{}.zst",
-                    id.get(..2).unwrap_or_default(),
-                    id.get(2..4).unwrap_or_default(),
-                    id.get(4..).unwrap_or_default(),
-                ),
+                archive: format!("pages_by_id/{a}/{b}/{rest}.zst"),
                 id,
                 slug: p.slug,
                 title: p.title,
@@ -290,6 +299,9 @@ fn write_if_changed(dest: &Path, bytes: &[u8]) -> Result<bool> {
     }
     std::fs::rename(&tmp, dest)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    if let Some(parent) = dest.parent() {
+        crate::blobs::sync_dir(parent).context("fsync manifest dir")?;
+    }
     Ok(true)
 }
 

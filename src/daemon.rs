@@ -20,15 +20,31 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut locks = Vec::new();
     let mut handles = Vec::new();
     for site in cfg.instance.sites.clone() {
-        let (db, lock) = Db::open_locked(&cfg.site_db(&site))?;
-        locks.push(lock);
+        // One unreachable site must not take the others down with it.
+        let (db, lock) = match Db::open_locked(&cfg.site_db(&site)) {
+            Ok(opened) => opened,
+            Err(e) => {
+                tracing::error!(site, error = %e, "opening site DB failed; site skipped");
+                continue;
+            }
+        };
         // Idempotent seeding (also re-seeds anything deleted by hand).
-        let seeded = db.enqueue(&jobs::seed_periodic())?;
+        let seeded = match db.enqueue(&jobs::seed_periodic()) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(site, error = %e, "seeding periodic jobs failed; site skipped");
+                continue;
+            }
+        };
         if seeded > 0 {
             tracing::info!(site, seeded, "seeded periodic jobs");
         }
+        locks.push(lock);
         let handle = tokio::spawn(site_worker(cfg.clone(), Arc::clone(&wik), db, site));
         handles.push(handle);
+    }
+    if handles.is_empty() {
+        anyhow::bail!("no site could be started");
     }
 
     tracing::info!(
@@ -97,6 +113,8 @@ async fn site_worker(cfg: Config, wik: Arc<Wikidot>, db: Db, site: String) {
                                 "job failed; will retry"
                             )
                         }
+                        // SQLite itself is misbehaving; the row stays
+                        // `running` and startup recovery re-queues it.
                         Err(e) => {
                             tracing::error!(site, job_id, error = %e, "recording failure failed")
                         }
@@ -105,7 +123,27 @@ async fn site_worker(cfg: Config, wik: Arc<Wikidot>, db: Db, site: String) {
                 }
             };
             if let Err(e) = result {
-                tracing::error!(site, job_id, error = %e, "job completion failed");
+                // The effects transaction rolled back atomically; re-queue
+                // with backoff instead of leaving the row `running` until
+                // the next daemon restart (the fetched data is simply
+                // refetched — every effect is idempotent).
+                tracing::warn!(site, job_id, error = %e, "job completion failed; re-queueing");
+                match db.fail(job_id, &format!("completion failed: {e}"), false) {
+                    Ok(crate::db::FailOutcome::Dead) => {
+                        tracing::error!(site, kind, job_id, "job dead-lettered after completion failures")
+                    }
+                    Ok(crate::db::FailOutcome::Retry { run_at }) => {
+                        tracing::warn!(site, kind, job_id, run_at, "re-queued")
+                    }
+                    Err(e2) => {
+                        tracing::error!(
+                            site,
+                            job_id,
+                            error = %e2,
+                            "re-queueing failed; startup recovery will retry"
+                        )
+                    }
+                }
             }
             drop(permit);
         });

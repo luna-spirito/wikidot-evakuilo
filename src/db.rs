@@ -20,7 +20,7 @@
 //!   completion DELETES it (`complete_ephemeral`) — no dedup that could
 //!   swallow a second signal, no tombstone that could lie.
 //!
-//! Periodic jobs (`discover`, `shell.sync`, `out.update`) are durable and
+//! Periodic jobs (`discover`, `shell.sync`, `out.update`, `backfill`) are durable and
 //! never finish — `complete` with a reschedule flips them back to `pending`
 //! at `now + interval` (the interval comes from the live config, never
 //! from the payload: the payload is the dedup key).
@@ -176,8 +176,9 @@ pub struct NewJob {
     /// <= 0 = unlimited (periodic jobs must never dead-letter).
     pub max_attempts: i64,
     /// Resurrect a `done`/`dead` job with this (kind, payload) back to
-    /// `pending` — for state-diff jobs (theme.crawl) and pure jobs worth
-    /// reviving after a dead-letter. Jobs that are pending/running are left
+    /// `pending` — for state-diff jobs (theme.crawl) and fetches re-armed
+    /// by the periodic backfill (dead-lettered attempts must not strand the
+    /// content they were fetching). Jobs that are pending/running are left
     /// alone (dedupe as before). Meaningless for ephemeral kinds.
     pub resurrect: bool,
 }
@@ -492,6 +493,20 @@ impl Db {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
+    }
+
+    /// Whether a revision is recorded in `denied_revisions` (permanently
+    /// unobtainable). Terminal — callers skip re-attempts.
+    pub fn is_denied(&self, page_id: i64, rev_no: i64) -> Result<bool> {
+        let conn = self.0.lock();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM denied_revisions WHERE page_id=?1 AND rev_no=?2",
+                params![page_id, rev_no],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// `files.status` for a path; None if the row is absent.

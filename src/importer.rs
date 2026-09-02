@@ -269,8 +269,21 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
                 }
             }
             if !linked {
-                // Cross-device or exotic: fall back to a copy.
-                std::fs::copy(&blob, &dest)?;
+                // Cross-device or exotic: fall back to a copy — tmp + fsync +
+                // rename, because a later import TRUSTS an existing dest
+                // (`dest.exists()` above); a partial copy must never
+                // masquerade as a complete blob.
+                let tmp = dest.with_extension("import.tmp");
+                {
+                    let mut src = std::fs::File::open(&blob)?;
+                    let mut dst = std::fs::File::create(&tmp)?;
+                    std::io::copy(&mut src, &mut dst)?;
+                    dst.sync_all()?;
+                }
+                std::fs::rename(&tmp, &dest)?;
+                if let Some(parent) = dest.parent() {
+                    crate::blobs::sync_dir(parent)?;
+                }
                 stats.blobs_linked += 1;
             }
             let size = std::fs::metadata(&blob)
@@ -284,6 +297,19 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
                 rusqlite::params![path, url, sha, size, db::now(), db::now()],
             )?;
             stats.files += 1;
+        }
+
+        // 4b. Files left 'pending' (hand-placed, non-sharded legacy blobs —
+        //     or a partial earlier import) get fetch jobs; without one they
+        //     would sit pending forever.
+        {
+            let mut stmt = tx.prepare("SELECT path FROM files WHERE status='pending'")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let mut j = jobs::file_fetch(&row?);
+                j.resurrect = true;
+                jobs_to_enqueue.push(j);
+            }
         }
 
         // 5. Watermark: v1 singleton → v2 meta JSON (same shape the daemon

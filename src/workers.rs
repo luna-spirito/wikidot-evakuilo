@@ -70,7 +70,8 @@ pub async fn run_job(db: &Db, cfg: &Config, wik: &Wikidot, site: &str, job: &db:
         jobs::kind::FILE_FETCH => file_fetch(db, &api, &out_dir, job).await,
         jobs::kind::SHELL_SYNC => shell_sync(db, cfg, &api).await,
         jobs::kind::THEME_CRAWL => theme_crawl(db, &api, &out_dir, job).await,
-        jobs::kind::OUT_UPDATE => out_update(db, cfg, site),
+        jobs::kind::OUT_UPDATE => out_update(db, cfg, site).await,
+        jobs::kind::BACKFILL => backfill(cfg),
         other => Ok(Outcome::Fail {
             error: format!("unknown job kind '{other}'"),
             permanent: true,
@@ -84,11 +85,14 @@ pub async fn run_job(db: &Db, cfg: &Config, wik: &Wikidot, site: &str, job: &db:
 
 // ── discover: RecentChanges watermark scan ──
 //
-// Port of v1's iterator semantics: locate the feed page containing the
-// watermark (binary search), walk toward page 1 (newer), emit every entry
-// not older than the watermark, then advance the watermark to the newest
-// entry seen. A cold start (no watermark) locates the deepest feed page and
-// walks the entire feed. The whole scan commits once at the end: a crash
+// Snapshot page 1 first: its head becomes the next watermark BEFORE any
+// collection happens, so changes arriving mid-scan are strictly newer than
+// it and belong to the next interval. Then walk deeper (page 2, 3, …) until
+// the old watermark — or the end of the feed, on a cold start — shows up,
+// emitting every entry not older than it. Newest-first walking makes the
+// sliding feed OVERLAP between window fetches instead of gapping: oldest-
+// first (v1's direction) permanently skips entries that slide across a page
+// boundary mid-scan. The whole scan commits once at the end: a crash
 // mid-scan re-runs it from the old watermark.
 
 const WATERMARK_KEY: &str = "saved_up_to";
@@ -101,41 +105,40 @@ async fn discover(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome, F
         .flatten()
         .and_then(|v| serde_json::from_str(&v).ok());
 
-    let start_page = match &wm {
-        None => find_deepest_page(api).await?,
-        Some(w) => find_watermark_page(api, w).await?,
-    };
+    let first = api.fetch_site_changes(1, 200).await?;
+    if first.is_empty() {
+        // Brand-new site, or a transient parse-to-nothing: keep the old
+        // watermark and try again next interval.
+        tracing::warn!(site, "feed page 1 empty; keeping watermark");
+        return Ok(complete(Some(cfg.monitor_interval_s), noop_effects()));
+    }
+    let mut new_wm = first[0].clone();
+    if let Some(w) = &wm
+        && new_wm.ts <= w.ts
+    {
+        // Bogus/future watermark (clock skew): never regress it.
+        new_wm = w.clone();
+    }
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut new_wm: Option<ChangeEntry> = wm.clone();
-    let mut page = start_page;
-    while page >= 1 {
+    let mut reached_wm = absorb_window(site, &first, &wm, &mut seen);
+    let mut page = 2i64;
+    while !reached_wm {
         let window = api.fetch_site_changes(page, 200).await?;
         if window.is_empty() {
+            // Ran off the feed: cold start reached the end, or a watermark
+            // older than the feed's entire history (catch-up collected
+            // everything there is).
             break;
         }
-        let head = window.first().cloned();
         tracing::debug!(site, page, entries = window.len(), "feed window");
-        for entry in &window {
-            if let Some(w) = &wm {
-                // v1 take_while: stop at the watermark entry or anything older.
-                if entry == w || entry.ts < w.ts {
-                    break;
-                }
-            }
-            if seen.insert(entry.slug.as_str()) {
-                tracing::debug!(site, slug = %entry.slug.as_str(), ts = entry.ts, "change discovered");
-            }
-        }
-        if page == 1 {
-            new_wm = head;
-        }
-        page -= 1;
+        reached_wm = absorb_window(site, &window, &wm, &mut seen);
+        page += 1;
     }
 
     let n = seen.len();
     let slugs: Vec<String> = seen.into_iter().collect();
-    let watermark = new_wm;
+    let watermark = Some(new_wm);
     let effects: Effects = Box::new(move |tx| {
         if let Some(w) = &watermark {
             tx.execute(
@@ -152,77 +155,25 @@ async fn discover(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome, F
     Ok(complete(Some(cfg.monitor_interval_s), effects))
 }
 
-/// Binary-search the deepest non-empty feed page (cold start). Probes
-/// exponentially from page 1, then bisects the empty/non-empty boundary.
-async fn find_deepest_page(api: &SiteApi<'_>) -> Result<i64, FetchError> {
-    let mut lo = 1i64;
-    let mut hi = 1i64;
-    loop {
-        let window = api.fetch_site_changes(hi, 200).await?;
-        if window.is_empty() {
-            break;
+/// v1 take_while semantics: collect a window's entries until the watermark
+/// entry (or anything older) shows up; returns whether the walk reached it.
+fn absorb_window(
+    site: &str,
+    window: &[ChangeEntry],
+    wm: &Option<ChangeEntry>,
+    seen: &mut HashSet<String>,
+) -> bool {
+    for entry in window {
+        if let Some(w) = wm
+            && (entry == w || entry.ts < w.ts)
+        {
+            return true;
         }
-        lo = hi;
-        hi *= 2;
-        if hi > 100_000 {
-            return Ok(lo);
-        }
-    }
-    // lo is non-empty, hi is empty; find the deepest non-empty page.
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        let window = api.fetch_site_changes(mid, 200).await?;
-        if window.is_empty() {
-            hi = mid;
-        } else {
-            lo = mid;
+        if seen.insert(entry.slug.as_str()) {
+            tracing::debug!(site, slug = %entry.slug.as_str(), ts = entry.ts, "change discovered");
         }
     }
-    Ok(lo)
-}
-
-/// Binary-search the page whose window straddles the watermark:
-/// head >= wm >= tail (v1 `classify_straddle`).
-async fn find_watermark_page(api: &SiteApi<'_>, wm: &ChangeEntry) -> Result<i64, FetchError> {
-    let mut lo = 1i64;
-    let mut hi = 1i64;
-    loop {
-        let window = api.fetch_site_changes(hi, 200).await?;
-        let stop = match window.last() {
-            None => true, // ran off the feed
-            Some(tail) => wm.ts >= tail.ts,
-        };
-        if stop {
-            break;
-        }
-        lo = hi;
-        hi *= 2;
-        if hi > 100_000 {
-            return Ok(lo);
-        }
-    }
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        let window = api.fetch_site_changes(mid, 200).await?;
-        let go_deeper = match (window.first(), window.last()) {
-            (None, _) => false, // empty window: wm is shallower
-            (Some(_head), None) => false,
-            (Some(head), Some(_tail)) => {
-                if wm.ts > head.ts {
-                    false // window entirely newer: wm is shallower
-                } else {
-                    // window entirely older, or straddles: start here or deeper
-                    true
-                }
-            }
-        };
-        if go_deeper {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    Ok(lo.max(1))
+    false
 }
 
 // ── page.sync: resolve a slug → page row + revision metas + file listing ──
@@ -257,7 +208,7 @@ async fn page_sync(db: &Db, api: &SiteApi<'_>, job: &db::Job) -> Result<Outcome,
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(page_id) DO UPDATE SET
                slug=excluded.slug, title=excluded.title, tags=excluded.tags,
-               updated_at=excluded.updated_at",
+               updated_at=COALESCE(excluded.updated_at, pages.updated_at)",
             params![
                 page_id,
                 slug.as_str(),
@@ -274,13 +225,14 @@ async fn page_sync(db: &Db, api: &SiteApi<'_>, job: &db::Job) -> Result<Outcome,
                  VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![page_id, r.rev_no, r.rev_id, r.ts, r.author],
             )?;
-            // Always enqueue: done jobs for NULL-content rows resurrect, and
-            // rows that already have content complete as a cheap no-op.
-            rev_jobs.push(jobs::revision_fetch(page_id, r.rev_no, &r.rev_id));
-        }
-        // resurrect in case an earlier attempt dead-lettered
-        for j in rev_jobs.iter_mut() {
+            // Always enqueue the fresh ones: rows that already have content
+            // complete as a cheap no-op. resurrect re-arms a dead job if the
+            // row was hand-repaired; routine revival of dead fetches is the
+            // periodic backfill's job (revs behind max_rev never reappear
+            // in new_revs).
+            let mut j = jobs::revision_fetch(page_id, r.rev_no, &r.rev_id);
             j.resurrect = true;
+            rev_jobs.push(j);
         }
         enqueue_on(tx, &rev_jobs)?;
         let mut file_jobs = Vec::new();
@@ -314,13 +266,27 @@ async fn revision_fetch(
     let p: P = serde_json::from_str(&job.payload)
         .map_err(|e| FetchError::Parse(format!("bad payload: {e}")))?;
 
-    // Fast path: already fetched.
+    // Fast path: already fetched, or recorded as permanently unobtainable —
+    // denied rows are terminal and must not be re-attempted across rescans.
     if let Some((Some(_content), _, _)) = db.revision_state(p.page_id, p.rev_no).ok().flatten() {
+        return Ok(complete(None, noop_effects()));
+    }
+    if db.is_denied(p.page_id, p.rev_no).unwrap_or(false) {
         return Ok(complete(None, noop_effects()));
     }
 
     let source = match api.fetch_revision_source(&p.rev_id).await {
         Ok(s) => s,
+        Err(FetchError::NotFound) => {
+            // A 404 from the AJAX connector is site/CDN weirdness, not
+            // evidence the revision is gone (the listing just vouched for
+            // it): surface as a transient error so the queue retries — and
+            // the periodic backfill keeps dead-lettered attempts alive.
+            return Err(FetchError::Http(format!(
+                "HTTP 404 fetching source of rev {}",
+                p.rev_id
+            )));
+        }
         Err(FetchError::Forbidden) => {
             // Permanently private revision: record it (v1 `revs_denied`).
             let (ts, author) = db
@@ -537,24 +503,30 @@ async fn theme_crawl(
                 && let Ok(bytes) = std::fs::read(blobs::blob_path(out_dir, &sha))
             {
                 return match String::from_utf8(bytes) {
-                    // Binary saved earlier (an `@import url(font.woff2)`
-                    // masquerader): already archived, don't descend.
                     Ok(text) => {
                         *from_blob.lock() += 1;
-                        Some(text)
+                        Some(crate::theme::Fetched::Css(text))
                     }
-                    Err(_) => None,
+                    // Binary saved earlier (an `@import url(font.woff2)`
+                    // masquerader): already archived, don't descend.
+                    Err(_) => Some(crate::theme::Fetched::Binary),
                 };
             }
             match api.fetch_public(&url).await {
-                Ok(bytes) => match blobs::write_blob(out_dir, &bytes) {
-                    Ok(sha) => {
-                        saved.lock().push((path, row_url, sha, bytes.len() as i64));
-                        String::from_utf8(bytes).ok()
+                Ok(bytes) => {
+                    let size = bytes.len() as i64;
+                    match blobs::write_blob(out_dir, &bytes) {
+                        Ok(sha) => {
+                            saved.lock().push((path, row_url, sha, size));
+                            match String::from_utf8(bytes) {
+                                Ok(text) => Some(crate::theme::Fetched::Css(text)),
+                                Err(_) => Some(crate::theme::Fetched::Binary),
+                            }
+                        }
+                        // Blob-write failure (disk trouble): failed URL.
+                        Err(_) => None,
                     }
-                    // Blob-write failure (disk trouble): failed URL.
-                    Err(_) => None,
-                },
+                }
                 Err(FetchError::NotFound) => {
                     missing.lock().push(path);
                     None
@@ -565,8 +537,11 @@ async fn theme_crawl(
     })
     .await;
 
-    // url() assets: same store-or-skip, no descending.
+    // url() assets: same store-or-skip, no descending. Fetch and blob-write
+    // failures MUST land in marker_failed: a silent drop would write a clean
+    // crawl marker and the asset would never be retried.
     let mut asset_ok = 0usize;
+    let mut asset_failed: Vec<String> = Vec::new();
     let mut asset_urls = outcome.assets.clone();
     asset_urls.sort();
     asset_urls.dedup();
@@ -580,13 +555,17 @@ async fn theme_crawl(
         }
         match api.fetch_public(url).await {
             Ok(bytes) => {
-                if let Ok(sha) = blobs::write_blob(out_dir, &bytes) {
-                    saved.lock().push((path, row_url, sha, bytes.len() as i64));
-                    asset_ok += 1;
+                let size = bytes.len() as i64;
+                match blobs::write_blob(out_dir, &bytes) {
+                    Ok(sha) => {
+                        saved.lock().push((path, row_url, sha, size));
+                        asset_ok += 1;
+                    }
+                    Err(_) => asset_failed.push(url.clone()),
                 }
             }
             Err(FetchError::NotFound) => missing.lock().push(path),
-            Err(_) => {}
+            Err(_) => asset_failed.push(url.clone()),
         }
     }
 
@@ -603,6 +582,7 @@ async fn theme_crawl(
     // Marker last, after everything the crawl could do: crash earlier = no
     // marker = re-armed by the next shell.sync.
     let mut marker_failed: Vec<String> = outcome.failed.clone();
+    marker_failed.extend(asset_failed);
     for u in &asset_urls {
         let (path, _) = parsers::file_row_paths(&api.site, u);
         if missing_paths.contains(&path) {
@@ -662,9 +642,16 @@ async fn theme_crawl(
 
 // ── out.update: publish derived artifacts ──
 
-fn out_update(db: &Db, cfg: &Config, site: &str) -> Result<Outcome, FetchError> {
+async fn out_update(db: &Db, cfg: &Config, site: &str) -> Result<Outcome, FetchError> {
+    // zstd level 19 packing is seconds of CPU per page: keep it off the
+    // async workers so it can't stall the runtime driving HTTP.
     let out_dir = cfg.site_out(site);
-    let stats = out::publish(db, site, &out_dir, cfg.zstd_level)
+    let site_name = site.to_string();
+    let level = cfg.zstd_level;
+    let db = db.clone();
+    let stats = tokio::task::spawn_blocking(move || out::publish(&db, &site_name, &out_dir, level))
+        .await
+        .map_err(|e| FetchError::Http(format!("publish join: {e}")))?
         .map_err(|e| FetchError::Http(format!("publish: {e}")))?;
     tracing::info!(
         site,
@@ -674,4 +661,52 @@ fn out_update(db: &Db, cfg: &Config, site: &str) -> Result<Outcome, FetchError> 
         "out/ published"
     );
     Ok(complete(Some(cfg.out_interval_s), noop_effects()))
+}
+
+// ── backfill: resurrect dead fetches for known-missing content ──
+//
+// A dead-lettered fetch job is invisible to re-discovery: page.sync only
+// enqueues revisions ABOVE max_rev (dead rows sit at or below it) and its
+// file enqueues dedupe against the dead row. Without this sweep, one
+// dead-letter strands that content forever. The sweep enqueues with
+// `resurrect`: pending/running jobs are untouched, dead ones re-arm with a
+// fresh attempt budget, and rows with no job at all get one.
+
+fn backfill(cfg: &Config) -> Result<Outcome, FetchError> {
+    let effects: Effects = Box::new(|tx| {
+        let mut jobs = Vec::new();
+        let mut stmt = tx.prepare(
+            "SELECT r.page_id, r.rev_no, r.rev_id FROM revisions r
+             WHERE r.content IS NULL AND NOT EXISTS (
+               SELECT 1 FROM denied_revisions d
+               WHERE d.page_id = r.page_id AND d.rev_no = r.rev_no)",
+        )?;
+        let revs = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (page_id, rev_no, rev_id) in &revs {
+            let mut j = jobs::revision_fetch(*page_id, *rev_no, rev_id);
+            j.resurrect = true;
+            jobs.push(j);
+        }
+        let mut stmt = tx.prepare("SELECT path FROM files WHERE status='pending'")?;
+        let files = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for path in &files {
+            let mut j = jobs::file_fetch(path);
+            j.resurrect = true;
+            jobs.push(j);
+        }
+        enqueue_on(tx, &jobs)?;
+        if !jobs.is_empty() {
+            tracing::info!(revs = revs.len(), files = files.len(), "backfill armed");
+        }
+        Ok(())
+    });
+    Ok(complete(Some(cfg.backfill_interval_s), effects))
 }

@@ -34,6 +34,11 @@ pub struct Config {
     #[serde(default = "default_out")]
     pub out_interval_s: i64,
 
+    /// Reconciliation sweep interval: re-arm dead fetch jobs for content
+    /// the DB knows is missing (contentless revisions, pending files).
+    #[serde(default = "default_backfill")]
+    pub backfill_interval_s: i64,
+
     /// zstd compression level for out/ page archives.
     #[serde(default = "default_zstd")]
     pub zstd_level: i32,
@@ -65,6 +70,9 @@ fn default_shell() -> i64 {
 }
 fn default_out() -> i64 {
     300
+}
+fn default_backfill() -> i64 {
+    3600
 }
 fn default_zstd() -> i32 {
     19

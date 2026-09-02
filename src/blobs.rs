@@ -2,7 +2,9 @@
 //!
 //! Layout matches v1's `_files/` exactly — `ab/cd/<sha256[4..]>` — so the
 //! legacy importer can move blobs without renaming. Blobs are immutable:
-//! write is tmp + fsync + rename, and an existing target short-circuits.
+//! write is tmp + fsync + rename + directory fsync (the bytes are the only
+//! copy of an attachment, so the rename must survive power loss before the
+//! DB row referencing it commits), and an existing target short-circuits.
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +33,32 @@ pub fn write_blob(out_dir: &Path, bytes: &[u8]) -> Result<String> {
     }
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    // Blob bytes are the only copy of an attachment — the DB stores hashes,
+    // not content — and the `files` row referencing this blob commits right
+    // after write_blob returns (durable: synchronous=FULL). The blob must be
+    // on disk first: the file fsync above covers the bytes, this covers the
+    // rename's directory entry plus any fresh shard dirs (bounded walk — the
+    // shard is exactly files_ca/<2>/<2> under out_dir).
+    let mut dir = dest.parent().map(Path::to_path_buf);
+    let mut depth = 0;
+    while let Some(d) = dir
+        && depth < 8
+    {
+        sync_dir(&d)?;
+        if d == out_dir {
+            break;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+        depth += 1;
+    }
     Ok(hash)
+}
+
+/// fsync a directory so a just-renamed entry survives power loss.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("fsyncing {}", dir.display()))
 }
 
 /// `out/files_ca/ab/cd/<sha[4..]>` (v1 sharding: 2/2/rest of the key).

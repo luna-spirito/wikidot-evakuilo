@@ -38,12 +38,23 @@ pub struct CrawlOutcome {
     pub failed: Vec<String>,
 }
 
-/// BFS the `@import` graph from `roots`. `fetch` returns the decoded CSS
-/// body for a URL, or `None` for a failure / non-text body.
+/// What the injected fetch closure got for one URL.
+#[derive(Debug)]
+pub enum Fetched {
+    /// A decoded CSS body to descend into.
+    Css(String),
+    /// Archived bytes that are not CSS (a font behind `@import url(…)`):
+    /// saved by the closure, nothing to descend into — NOT a failure.
+    Binary,
+}
+
+/// BFS the `@import` graph from `roots`. `fetch` returns `Some(Fetched)`
+/// for anything saved (CSS to descend into, or a binary masquerader) and
+/// `None` for a failure.
 pub async fn crawl<F, Fut>(roots: &[String], mut fetch: F) -> CrawlOutcome
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Option<String>>,
+    Fut: Future<Output = Option<Fetched>>,
 {
     let mut queue: VecDeque<String> = roots.iter().cloned().collect();
     let mut visited: HashSet<String> = HashSet::new();
@@ -54,9 +65,13 @@ where
         if !visited.insert(key) {
             continue;
         }
-        let Some(body) = fetch(url.clone()).await else {
-            out.failed.push(url);
-            continue;
+        let body = match fetch(url.clone()).await {
+            Some(Fetched::Css(body)) => body,
+            Some(Fetched::Binary) => continue,
+            None => {
+                out.failed.push(url);
+                continue;
+            }
         };
         // Resolve every child reference against THIS document's URL.
         let imports: Vec<String> = parsers::extract_css_imports(&body)
@@ -85,10 +100,10 @@ mod tests {
 
     fn map_fetch(
         pages: HashMap<&'static str, &'static str>,
-    ) -> impl FnMut(String) -> std::future::Ready<Option<String>> {
+    ) -> impl FnMut(String) -> std::future::Ready<Option<Fetched>> {
         move |url: String| {
             let body = pages.get(url.as_str()).copied();
-            std::future::ready(body.map(String::from))
+            std::future::ready(body.map(|b| Fetched::Css(String::from(b))))
         }
     }
 
@@ -154,10 +169,31 @@ mod tests {
             ],
             |url: String| async move {
                 assert_eq!(url, "https://x.test/a.css");
-                Some("/* css */".to_string())
+                Some(Fetched::Css("/* css */".to_string()))
             },
         )
         .await;
         assert_eq!(out.css.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn binary_masquerader_is_saved_not_failed() {
+        // A font behind `@import url(...)`: archived by the closure, not
+        // descendable, and crucially NOT a failure — a failed marker would
+        // re-arm the crawl forever for something already evacuated.
+        let out = crawl(
+            &["https://x.test/a.css".into()],
+            |url: String| async move {
+                match url.as_str() {
+                    "https://x.test/a.css" => {
+                        Some(Fetched::Css("@import url(font.woff2);".into()))
+                    }
+                    _ => Some(Fetched::Binary),
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.css.len(), 1);
+        assert!(out.failed.is_empty());
     }
 }
