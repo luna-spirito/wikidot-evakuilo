@@ -142,9 +142,7 @@ pub fn publish(db: &Db, site: &str, out_dir: &Path, zstd_level: i32) -> Result<P
     let mut stats = PubStats::default();
 
     for page in db.pages_to_pack()? {
-        let revisions = db.page_revisions_full(page.page_id)?;
-        debug_assert_eq!(revisions.len() as i64, page.stored_count);
-        if revisions.is_empty() {
+        if page.stored_count == 0 {
             // Nothing fetchable yet — leave any existing archive alone and
             // keep packed_revs at 0 (equal counts) so it isn't rewritten.
             db.set_packed(page.page_id, 0)?;
@@ -157,6 +155,10 @@ pub fn publish(db: &Db, site: &str, out_dir: &Path, zstd_level: i32) -> Result<P
             stats.pages_skipped += 1;
             continue;
         }
+        // Expensive part: full revision texts, only for pages actually
+        // being (re)packed.
+        let revisions = db.page_revisions_full(page.page_id)?;
+        debug_assert_eq!(revisions.len() as i64, page.stored_count);
         let identity = PageIdentity {
             site,
             page_id: &page.id_str(),
