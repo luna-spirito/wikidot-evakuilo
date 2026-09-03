@@ -16,6 +16,13 @@
 # The daemon is self-sufficient on start: it opens (creating if needed) the
 # per-site SQLite databases under {settings.data_dir}/{instance} and seeds
 # the periodic job queue itself, so there is no separate init step.
+#
+# The data dir and everything the daemon creates are group-readable by the
+# dedicated `evakuilo` group (UMask 0027). A consumer of the published out/
+# tree — even a DynamicUser service like kolorinko — reads it by joining
+# that group:
+#   systemd.services.<consumer>.serviceConfig.SupplementaryGroups =
+#     [ config.services.evakuilo.group ];
 self:
 { config, lib, pkgs, ... }:
 
@@ -125,8 +132,12 @@ in
     };
     users.groups.evakuilo = lib.mkIf (cfg.group == "evakuilo") { };
 
+    # 0750/0027: out/ is a publication tree — a consumer service (e.g. a
+    # mirror front-end) gains read access by joining the dedicated group
+    # via SupplementaryGroups; meta/ becomes group-readable too, which is
+    # fine for a group with no other members.
     systemd.tmpfiles.rules = [
-      "d ${cfg.settings.data_dir} 0700 ${cfg.user} ${cfg.group} - -"
+      "d ${cfg.settings.data_dir} 0750 ${cfg.user} ${cfg.group} - -"
     ];
 
     systemd.services.evakuilo = {
@@ -174,7 +185,7 @@ in
         MemoryDenyWriteExecute = true;
         SystemCallArchitectures = "native";
         SystemCallFilter = [ "@system-service" ];
-        UMask = "0077";
+        UMask = "0027";
       };
     };
   };
