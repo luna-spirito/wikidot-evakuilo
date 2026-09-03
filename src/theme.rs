@@ -181,17 +181,12 @@ mod tests {
         // A font behind `@import url(...)`: archived by the closure, not
         // descendable, and crucially NOT a failure — a failed marker would
         // re-arm the crawl forever for something already evacuated.
-        let out = crawl(
-            &["https://x.test/a.css".into()],
-            |url: String| async move {
-                match url.as_str() {
-                    "https://x.test/a.css" => {
-                        Some(Fetched::Css("@import url(font.woff2);".into()))
-                    }
-                    _ => Some(Fetched::Binary),
-                }
-            },
-        )
+        let out = crawl(&["https://x.test/a.css".into()], |url: String| async move {
+            match url.as_str() {
+                "https://x.test/a.css" => Some(Fetched::Css("@import url(font.woff2);".into())),
+                _ => Some(Fetched::Binary),
+            }
+        })
         .await;
         assert_eq!(out.css.len(), 1);
         assert!(out.failed.is_empty());

@@ -82,9 +82,7 @@ pub fn sniff_content_type(bytes: &[u8], name: &str) -> Option<String> {
         // (`…/css?family=Exo+2` is still a `.css`-ish URL).
         .or_else(|| {
             let bare = name.split(['?', '#']).next().unwrap_or(name);
-            mime_guess::from_path(bare)
-                .first_raw()
-                .map(str::to_string)
+            mime_guess::from_path(bare).first_raw().map(str::to_string)
         })
 }
 
@@ -157,6 +155,9 @@ mod tests {
             sniff_content_type_at(&css, "files/cdn/x/style.css").as_deref(),
             Some("text/css")
         );
-        assert_eq!(sniff_content_type_at(&dir.path().join("nope"), "a.png"), None);
+        assert_eq!(
+            sniff_content_type_at(&dir.path().join("nope"), "a.png"),
+            None
+        );
     }
 }

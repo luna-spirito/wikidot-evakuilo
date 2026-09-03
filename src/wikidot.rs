@@ -300,10 +300,7 @@ mod tests {
     #[test]
     fn media_type_strips_parameters_and_lowercases() {
         assert_eq!(ct("image/png").as_deref(), Some("image/png"));
-        assert_eq!(
-            ct("text/css; charset=utf-8").as_deref(),
-            Some("text/css")
-        );
+        assert_eq!(ct("text/css; charset=utf-8").as_deref(), Some("text/css"));
         assert_eq!(ct("Text/HTML;Charset=UTF-8").as_deref(), Some("text/html"));
         assert_eq!(ct(""), None);
         assert_eq!(ct("; charset=utf-8"), None);

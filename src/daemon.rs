@@ -130,7 +130,12 @@ async fn site_worker(cfg: Config, wik: Arc<Wikidot>, db: Db, site: String) {
                 tracing::warn!(site, job_id, error = %e, "job completion failed; re-queueing");
                 match db.fail(job_id, &format!("completion failed: {e}"), false) {
                     Ok(crate::db::FailOutcome::Dead) => {
-                        tracing::error!(site, kind, job_id, "job dead-lettered after completion failures")
+                        tracing::error!(
+                            site,
+                            kind,
+                            job_id,
+                            "job dead-lettered after completion failures"
+                        )
                     }
                     Ok(crate::db::FailOutcome::Retry { run_at }) => {
                         tracing::warn!(site, kind, job_id, run_at, "re-queued")

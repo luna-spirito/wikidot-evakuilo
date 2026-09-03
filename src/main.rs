@@ -21,7 +21,7 @@ mod theme;
 mod wikidot;
 mod workers;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -51,7 +51,10 @@ USAGE:
     evakuilo init                  create site databases + seed periodic jobs
     evakuilo status                per-site database statistics
     evakuilo run                   daemon (ctrl-c to stop)
-    evakuilo import-legacy [FROM]  one-shot v1 tree import (default: legacy/data)"
+    evakuilo import-legacy [FROM]  one-shot v1 tree import (default: legacy/data)
+
+Config is read from $EVAKUILO_CONFIG, falling back to evakuilo.toml in the
+working directory."
     );
     std::process::exit(2);
 }
@@ -74,8 +77,14 @@ fn init_tracing() {
 }
 
 fn load_config() -> Result<config::Config> {
-    config::Config::load(Path::new("evakuilo.toml"))
-        .context("evakuilo.toml not found in the working directory")
+    let path: &Path = &std::env::var_os("EVAKUILO_CONFIG")
+        .map_or_else(|| PathBuf::from("evakuilo.toml"), PathBuf::from);
+    config::Config::load(path).with_context(|| {
+        format!(
+            "config not found at {} (set EVAKUILO_CONFIG or run in a directory with evakuilo.toml)",
+            path.display()
+        )
+    })
 }
 
 fn cmd_init() -> Result<()> {

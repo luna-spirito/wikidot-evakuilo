@@ -220,7 +220,10 @@ mod tests {
 
         // Files/theme ride one tier and outrank intermediate history.
         assert_eq!(file_fetch("a.png").priority, prio::FILE);
-        assert_eq!(theme_crawl(&["http://x.test/a.css".into()]).priority, prio::FILE);
+        assert_eq!(
+            theme_crawl(&["http://x.test/a.css".into()]).priority,
+            prio::FILE
+        );
         assert!(prio::FILE > intermediate.priority);
 
         assert!(intermediate.priority > prio::BACKFILL);

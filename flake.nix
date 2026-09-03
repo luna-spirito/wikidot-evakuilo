@@ -15,6 +15,7 @@
 
   outputs =
     inputs@{
+      self,
       flake-parts,
       rust-overlay,
       crane,
@@ -33,6 +34,11 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
+
+      flake.nixosModules = {
+        evakuilo = import ./nix/nixos.nix self;
+        default = self.nixosModules.evakuilo;
+      };
 
       perSystem =
         { config, system, ... }:
@@ -53,8 +59,47 @@
           };
 
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          src = craneLib.cleanCargoSource ./.;
+
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+          };
+
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          evakuilo = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            meta = {
+              description = "Wikidot evacuation archiver: SQLite-first scrape state, per-page zstd publication tree";
+              mainProgram = "evakuilo";
+              license = pkgs.lib.licenses.agpl3Plus;
+            };
+          });
         in
         {
+          packages = {
+            inherit evakuilo;
+            default = evakuilo;
+          };
+
+          # Formatting is enforced by the pre-commit rustfmt hook instead:
+          # nightly rustfmt style drift would randomly break `nix flake check`.
+          checks = {
+            inherit evakuilo;
+            clippy = craneLib.cargoClippy (commonArgs // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- -D warnings";
+            });
+          };
+
+          # Keep the hooks devshell/commit-only: the cargo-deny advisories
+          # check fetches the RustSec DB and hangs in the offline Nix
+          # sandbox; compile/lint/test coverage in `nix flake check` comes
+          # from the crane checks above.
+          pre-commit.check.enable = false;
+
           pre-commit.settings.hooks = {
             rustfmt = {
               enable = true;

@@ -648,9 +648,8 @@ impl Db {
     /// Rows for `files.json`: path, hash, size, status, media type — by path.
     pub fn files_manifest(&self) -> Result<Vec<FileManifestRow>> {
         let conn = self.0.lock();
-        let mut stmt = conn.prepare(
-            "SELECT path, sha256, size, status, content_type FROM files ORDER BY path",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT path, sha256, size, status, content_type FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |r| {
             Ok(FileManifestRow {
                 path: r.get(0)?,

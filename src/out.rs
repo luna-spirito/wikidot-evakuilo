@@ -103,7 +103,11 @@ fn page_id_shards(page_id: &str) -> (String, String, String) {
 
 pub fn page_archive_path(out_dir: &Path, page_id: &str) -> PathBuf {
     let (a, b, rest) = page_id_shards(page_id);
-    out_dir.join("pages_by_id").join(a).join(b).join(format!("{rest}.zst"))
+    out_dir
+        .join("pages_by_id")
+        .join(a)
+        .join(b)
+        .join(format!("{rest}.zst"))
 }
 
 #[derive(Serialize)]

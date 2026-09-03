@@ -3,7 +3,7 @@ name = "evakuilo"
 version = "2.0.0-alpha.1"
 edition = "2024"
 description = "Wikidot evacuation archiver: SQLite-first scrape state, per-page zstd publication tree"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"

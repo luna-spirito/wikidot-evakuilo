@@ -233,12 +233,8 @@ async fn page_sync(db: &Db, api: &SiteApi<'_>, job: &db::Job) -> Result<Outcome,
             // row was hand-repaired; routine revival of dead fetches is the
             // periodic backfill's job (revs behind max_rev never reappear
             // in new_revs).
-            let mut j = jobs::revision_fetch(
-                page_id,
-                r.rev_no,
-                &r.rev_id,
-                Some(r.rev_no) == head_rev,
-            );
+            let mut j =
+                jobs::revision_fetch(page_id, r.rev_no, &r.rev_id, Some(r.rev_no) == head_rev);
             j.resurrect = true;
             rev_jobs.push(j);
         }
@@ -385,8 +381,7 @@ async fn file_fetch(
     let sha = blobs::write_blob(out_dir, &bytes)
         .map_err(|e| FetchError::Http(format!("blob write: {e}")))?;
     // Server's word first; sniff when it said nothing.
-    let content_type =
-        header_type.or_else(|| blobs::sniff_content_type(&bytes, &p.path));
+    let content_type = header_type.or_else(|| blobs::sniff_content_type(&bytes, &p.path));
     let url = format!("http://{}.wikidot.com/{}", api.site, p.path);
     let path = p.path.clone();
     let size = bytes.len() as i64;
