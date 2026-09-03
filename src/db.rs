@@ -157,7 +157,23 @@ const SCHEMA_V2: &str = r#"
 ALTER TABLE files ADD COLUMN content_type TEXT;
 "#;
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+/// v3: priority retune (see `jobs::prio`). Priorities are frozen on the
+/// row at enqueue time, so rows seated under the old table must be
+/// rewritten: shell.sync jumps to the top of the claim order (a cold-start
+/// site gets its identity + theme roots before the history backlog
+/// drains), and files/theme move above intermediate history. revision.fetch
+/// rows are untouched — their head/old split (20/8) did not change.
+/// Deliberately unscoped by status: a stale `running` row is recovered to
+/// `pending` carrying whatever priority it has, so it must be retuned too.
+/// The literals have no compiler tie to `jobs::prio` —
+/// `v3_retune_matches_prio_table` pins them together.
+const RETUNE_PRIORITIES_V3: &str = r#"
+UPDATE jobs SET priority=35 WHERE kind='shell.sync';
+UPDATE jobs SET priority=10 WHERE kind IN ('file.fetch', 'theme.crawl');
+UPDATE jobs SET priority=15 WHERE kind='page.sync';
+"#;
+
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, RETUNE_PRIORITIES_V3];
 
 // ── Job types ──
 
@@ -882,6 +898,44 @@ mod tests {
         assert_eq!(claimed[1].kind, "z");
         // Second claim: only the future job is pending, and it is not due.
         assert!(db.claim(10).unwrap().is_empty());
+    }
+
+    /// v3 must retune seated rows to exactly the current `jobs::prio`
+    /// values — the migration's SQL literals have no compiler tie to the
+    /// constants, so this test is the tie.
+    #[test]
+    fn v3_retune_matches_prio_table() {
+        let (_d, db, _l) = site("retune");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO jobs(kind, payload, priority, created_at) VALUES
+                 ('shell.sync',  '{}', -5, ?1),
+                 ('file.fetch',  '{}',  0, ?1),
+                 ('theme.crawl', '{}',  0, ?1),
+                 ('page.sync',   '{}', 10, ?1),
+                 ('revision.fetch', '{}', 8, ?1)",
+                params![now()],
+            )
+            .unwrap();
+            conn.execute_batch(RETUNE_PRIORITIES_V3).unwrap();
+        });
+        let prio_of = |kind: &str| {
+            db.with_conn(|c| {
+                c.query_row(
+                    "SELECT priority FROM jobs WHERE kind=?1",
+                    params![kind],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap()
+        };
+        assert_eq!(prio_of("shell.sync"), crate::jobs::prio::SHELL);
+        assert_eq!(prio_of("file.fetch"), crate::jobs::prio::FILE);
+        assert_eq!(prio_of("theme.crawl"), crate::jobs::prio::FILE);
+        assert_eq!(prio_of("page.sync"), crate::jobs::prio::PAGE);
+        // The head/old split is per-row and unchanged — v3 must not
+        // flatten it.
+        assert_eq!(prio_of("revision.fetch"), crate::jobs::prio::REVISION_OLD);
     }
 
     #[test]

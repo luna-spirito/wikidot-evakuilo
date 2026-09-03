@@ -42,10 +42,13 @@
 //! ## Priorities
 //!
 //! Priorities are per-row (set at enqueue time, see `prio`) and decide
-//! claim order when the queue backs up. v1's invariant is preserved: a
-//! fresh recent-change never waits behind the history backlog — discovery
-//! feed first, then each page's newest revision, then slug reconciliation,
-//! then intermediate history, files, publication.
+//! claim order when the queue backs up. The order is evacuation triage:
+//! the shell first — one cheap homepage GET that also seeds the theme
+//! crawl, without which the exported site is barely usable — then the
+//! freshness ladder (a fresh recent-change never waits behind the history
+//! backlog: discovery feed, newest revision, slug reconciliation), then
+//! files/theme, which the live edge references here and now, before
+//! intermediate history; derived publication comes last.
 
 use serde_json::json;
 
@@ -72,27 +75,32 @@ pub mod kind {
 }
 
 pub mod prio {
-    /// Enqueue-time claim priorities (higher runs first), mirroring v1's
-    /// two-rate-limiter-class scheme — a fresh recent-change must never
-    /// wait behind a multi-hour backlog drain:
+    /// Enqueue-time claim priorities (higher runs first) — an evacuation
+    /// triage: what makes the export *usable* and what the live edge needs
+    /// outranks bulk history, and derived publication comes last:
     ///
+    /// * 35 shell — one homepage GET per shell_interval_s that seeds the
+    ///   theme crawl; the top slot costs ~one rate-limit ticket a day and
+    ///   ends the cold-start starvation of identity + theme
     /// * 30 discovery feed · 20 the newest revision of a page (v1 "high")
-    /// * 10 slug reconciliation (v1: page fetches rode the high class)
+    /// * 15 slug reconciliation (v1: page fetches rode the high class)
+    /// * 10 files/theme — attachments and CSS referenced by the live edge
     /// *  8 intermediate revision history (v1 "low" slot)
-    /// *  0 files/theme · -5 shell · -10 publication
+    /// *  5 backfill sweep · -10 publication
     ///
     /// Frozen on the row at enqueue time: the head/intermediate split is
     /// inherently per-job, so a claim-time kind lookup cannot express it.
     /// Retuning the table therefore applies to future enqueues only;
     /// periodic jobs re-read nothing — their singleton row keeps the
-    /// priority it was seeded with.
+    /// priority it was seeded with (v3 retunes seated rows, see
+    /// `db::MIGRATIONS`).
+    pub const SHELL: i64 = 35;
     pub const DISCOVER: i64 = 30;
     pub const REVISION_HEAD: i64 = 20;
-    pub const PAGE: i64 = 10;
+    pub const PAGE: i64 = 15;
+    pub const FILE: i64 = 10;
     pub const REVISION_OLD: i64 = 8;
     pub const BACKFILL: i64 = 5;
-    pub const FILE: i64 = 0;
-    pub const SHELL: i64 = -5;
     pub const OUT: i64 = -10;
 }
 
@@ -193,17 +201,29 @@ pub fn theme_crawl(roots: &[String]) -> NewJob {
 mod tests {
     use super::*;
 
-    /// v1's freshness invariant: a page's newest revision outranks slug
-    /// reconciliation, which outranks intermediate history — a fresh edit
-    /// never waits behind the backlog drain.
+    /// The full claim order as one inequality chain: shell (usability of
+    /// the export) → discovery → freshness ladder (newest revision >
+    /// slug reconciliation > intermediate history) → files/theme →
+    /// backfill → publication.
     #[test]
-    fn revision_priority_splits_head_from_history_like_v1() {
+    fn priority_order_is_evacuation_triage() {
+        const { assert!(prio::SHELL > prio::DISCOVER) };
+        const { assert!(prio::DISCOVER > prio::REVISION_HEAD) };
+
         let head = revision_fetch(1, 9, "9", true);
         let intermediate = revision_fetch(1, 8, "8", false);
         let sync = page_sync("some:slug");
         assert_eq!(head.priority, prio::REVISION_HEAD);
         assert_eq!(intermediate.priority, prio::REVISION_OLD);
         assert!(head.priority > sync.priority);
-        assert!(sync.priority > intermediate.priority);
+        assert!(sync.priority > prio::FILE);
+
+        // Files/theme ride one tier and outrank intermediate history.
+        assert_eq!(file_fetch("a.png").priority, prio::FILE);
+        assert_eq!(theme_crawl(&["http://x.test/a.css".into()]).priority, prio::FILE);
+        assert!(prio::FILE > intermediate.priority);
+
+        assert!(intermediate.priority > prio::BACKFILL);
+        const { assert!(prio::BACKFILL > prio::OUT) };
     }
 }
