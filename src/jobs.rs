@@ -48,7 +48,8 @@
 //! freshness ladder (a fresh recent-change never waits behind the history
 //! backlog: discovery feed, newest revision, slug reconciliation), then
 //! files/theme, which the live edge references here and now, before
-//! intermediate history; derived publication comes last.
+//! intermediate history; publication rides just under the newest revision,
+//! so a fetch backlog can't stretch the out/ refresh cycle.
 
 use serde_json::json;
 
@@ -77,16 +78,21 @@ pub mod kind {
 pub mod prio {
     /// Enqueue-time claim priorities (higher runs first) — an evacuation
     /// triage: what makes the export *usable* and what the live edge needs
-    /// outranks bulk history, and derived publication comes last:
+    /// outranks bulk history, and publication claims just under the
+    /// newest revision (the incremental repack costs almost nothing, so
+    /// it never starves the fetchers it briefly outranks):
     ///
     /// * 35 shell — one homepage GET per shell_interval_s that seeds the
     ///   theme crawl; the top slot costs ~one rate-limit ticket a day and
     ///   ends the cold-start starvation of identity + theme
     /// * 30 discovery feed · 20 the newest revision of a page (v1 "high")
+    /// * 18 publication — under the newest revision only: the incremental
+    ///   repack is nearly free, and yielding to it alone keeps the out/
+    ///   refresh cycle tight even while the history backlog drains
     /// * 15 slug reconciliation (v1: page fetches rode the high class)
     /// * 10 files/theme — attachments and CSS referenced by the live edge
     /// *  8 intermediate revision history (v1 "low" slot)
-    /// *  5 backfill sweep · -10 publication
+    /// *  5 backfill sweep
     ///
     /// Frozen on the row at enqueue time: the head/intermediate split is
     /// inherently per-job, so a claim-time kind lookup cannot express it.
@@ -101,7 +107,7 @@ pub mod prio {
     pub const FILE: i64 = 10;
     pub const REVISION_OLD: i64 = 8;
     pub const BACKFILL: i64 = 5;
-    pub const OUT: i64 = -10;
+    pub const OUT: i64 = 18;
 }
 
 /// Event-class kinds: no stable identity, no dedup, deleted on completion.
@@ -202,9 +208,9 @@ mod tests {
     use super::*;
 
     /// The full claim order as one inequality chain: shell (usability of
-    /// the export) → discovery → freshness ladder (newest revision >
-    /// slug reconciliation > intermediate history) → files/theme →
-    /// backfill → publication.
+    /// the export) → discovery → newest revision → publication (a fetch
+    /// backlog must not stretch the out/ refresh cycle) → slug
+    /// reconciliation → files/theme → intermediate history → backfill.
     #[test]
     fn priority_order_is_evacuation_triage() {
         const { assert!(prio::SHELL > prio::DISCOVER) };
@@ -227,6 +233,9 @@ mod tests {
         assert!(prio::FILE > intermediate.priority);
 
         assert!(intermediate.priority > prio::BACKFILL);
-        const { assert!(prio::BACKFILL > prio::OUT) };
+        // Publication rides just under the newest revision, above the
+        // rest of the freshness ladder.
+        const { assert!(prio::REVISION_HEAD > prio::OUT) };
+        const { assert!(prio::OUT > prio::PAGE) };
     }
 }

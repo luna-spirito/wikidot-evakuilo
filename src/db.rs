@@ -173,7 +173,23 @@ UPDATE jobs SET priority=10 WHERE kind IN ('file.fetch', 'theme.crawl');
 UPDATE jobs SET priority=15 WHERE kind='page.sync';
 "#;
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, RETUNE_PRIORITIES_V3];
+/// v4: publication priority retune (see `jobs::prio`). `out.update` moves
+/// from the bottom of the claim order (-10) to just under the newest
+/// revision (18): the incremental repack is nearly free, so publication
+/// loses nothing by claiming promptly, and a fetch backlog no longer
+/// stretches the out/ refresh cycle. Same rules as v3 — deliberately
+/// unscoped by status, and pinned to the constant by
+/// `v4_retune_matches_prio_table`.
+const RETUNE_PRIORITIES_V4: &str = r#"
+UPDATE jobs SET priority=18 WHERE kind='out.update';
+"#;
+
+const MIGRATIONS: &[&str] = &[
+    SCHEMA_V1,
+    SCHEMA_V2,
+    RETUNE_PRIORITIES_V3,
+    RETUNE_PRIORITIES_V4,
+];
 
 // ── Job types ──
 
@@ -935,6 +951,33 @@ mod tests {
         // The head/old split is per-row and unchanged — v3 must not
         // flatten it.
         assert_eq!(prio_of("revision.fetch"), crate::jobs::prio::REVISION_OLD);
+    }
+
+    /// v4 must retune seated `out.update` rows to exactly
+    /// `jobs::prio::OUT` — the SQL literal has no compiler tie to the
+    /// constant, so this test is the tie.
+    #[test]
+    fn v4_retune_matches_prio_table() {
+        let (_d, db, _l) = site("retune4");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO jobs(kind, payload, priority, created_at) VALUES
+                 ('out.update', '{}', -10, ?1)",
+                params![now()],
+            )
+            .unwrap();
+            conn.execute_batch(RETUNE_PRIORITIES_V4).unwrap();
+        });
+        let prio: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT priority FROM jobs WHERE kind='out.update'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(prio, crate::jobs::prio::OUT);
     }
 
     #[test]
