@@ -23,6 +23,41 @@
       git-hooks,
       ...
     }:
+    let
+      # The build, as a pure function of its toolchain. `perSystem` below
+      # instantiates it with this flake's own default (`nightly.latest`);
+      # dentrado re-instantiates it with its pinned nightly, so one rustc
+      # builds every package the deployment ships.
+      mkEvakuilo =
+        { pkgs, rustToolchain }:
+        let
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          src = craneLib.cleanCargoSource ./.;
+
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+          };
+
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        in
+        {
+          evakuilo = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            meta = {
+              description = "Wikidot evacuation archiver: SQLite-first scrape state, per-page zstd publication tree";
+              mainProgram = "evakuilo";
+              license = pkgs.lib.licenses.agpl3Plus;
+            };
+          });
+
+          clippy = craneLib.cargoClippy (commonArgs // {
+            inherit cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets -- -D warnings";
+          });
+        };
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         git-hooks.flakeModule
@@ -39,6 +74,8 @@
         evakuilo = import ./nix/nixos.nix self;
         default = self.nixosModules.evakuilo;
       };
+
+      flake.lib = { inherit mkEvakuilo; };
 
       perSystem =
         { config, system, ... }:
@@ -58,41 +95,17 @@
             targets = [ "wasm32-unknown-unknown" ];
           };
 
-          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-
-          src = craneLib.cleanCargoSource ./.;
-
-          commonArgs = {
-            inherit src;
-            strictDeps = true;
-          };
-
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-          evakuilo = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-            meta = {
-              description = "Wikidot evacuation archiver: SQLite-first scrape state, per-page zstd publication tree";
-              mainProgram = "evakuilo";
-              license = pkgs.lib.licenses.agpl3Plus;
-            };
-          });
+          built = mkEvakuilo { inherit pkgs rustToolchain; };
         in
         {
           packages = {
-            inherit evakuilo;
-            default = evakuilo;
+            inherit (built) evakuilo;
+            default = built.evakuilo;
           };
 
           # Formatting is enforced by the pre-commit rustfmt hook instead:
           # nightly rustfmt style drift would randomly break `nix flake check`.
-          checks = {
-            inherit evakuilo;
-            clippy = craneLib.cargoClippy (commonArgs // {
-              inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- -D warnings";
-            });
-          };
+          checks = built;
 
           # Keep the hooks devshell/commit-only: the cargo-deny advisories
           # check fetches the RustSec DB and hangs in the offline Nix
