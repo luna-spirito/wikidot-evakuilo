@@ -45,6 +45,24 @@ pub fn extract_site_subtitle(html: &str) -> String {
     select_first_text(html, "#header h2")
 }
 
+/// The landing page slug from the homepage's HTML:
+/// `WIKIREQUEST.info.pageUnixName = "blog:_start"` → `Some("blog:_start")`.
+/// The homepage GET serves the landing page, so its unix name *is* the
+/// landing slug. Wikidot's emitter quotes with `"` (observed) but `'` is
+/// accepted too — the same script block uses both for other keys.
+pub fn extract_landing_slug(html: &str) -> Option<String> {
+    let rest = html.split_once("WIKIREQUEST.info.pageUnixName")?.1;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &rest[quote.len_utf8()..];
+    let end = inner.find(quote)?;
+    let slug = &inner[..end];
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
 // ── Theme roots (v1 parsers.extract_theme_imports + theme.plan_roots) ──
 
 /// The `@import` URLs from the page's `<style id="internal-style">` block.
@@ -451,6 +469,38 @@ mod tests {
         let html = r#"<script>WIKIREQUEST.info.pageId = 9992; WIKIREQUEST.info.pageUnixName="start";</script>"#;
         assert_eq!(extract_page_id(html).as_deref(), Some("9992"));
         assert_eq!(extract_page_id("no marker"), None);
+    }
+
+    #[test]
+    fn landing_slug() {
+        // Real kumawa homepage shape.
+        let html = r#"<script type="text/javascript">
+WIKIREQUEST.info.domain = "kumawa.wikidot.com";
+WIKIREQUEST.info.requestPageName = "blog:_start";
+WIKIREQUEST.info.pageUnixName = "blog:_start";
+WIKIREQUEST.info.pageId = 1457213925;
+</script>"#;
+        assert_eq!(extract_landing_slug(html).as_deref(), Some("blog:_start"));
+        // Default landing, no category.
+        assert_eq!(
+            extract_landing_slug(r#"WIKIREQUEST.info.pageUnixName = "start";"#).as_deref(),
+            Some("start")
+        );
+        // Single-quoted form.
+        assert_eq!(
+            extract_landing_slug(r#"WIKIREQUEST.info.pageUnixName = 'start';"#).as_deref(),
+            Some("start")
+        );
+        // Absent, unquoted or empty → None (caller keeps the last known value).
+        assert_eq!(extract_landing_slug("no marker"), None);
+        assert_eq!(
+            extract_landing_slug("WIKIREQUEST.info.pageUnixName = start;"),
+            None
+        );
+        assert_eq!(
+            extract_landing_slug(r#"WIKIREQUEST.info.pageUnixName = "";"#),
+            None
+        );
     }
 
     #[test]

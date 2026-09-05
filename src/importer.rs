@@ -510,16 +510,20 @@ fn parse_watermark(raw: &str) -> Option<ChangeEntry> {
     })
 }
 
-/// v1 `shell` file: `title:` / `subtitle:` / `theme_root:` lines.
+/// v1 `shell` file: `title:` / `subtitle:` / `theme_root:` lines (v2 also
+/// writes `landing:`; reading it keeps a re-import of v2 output lossless).
 fn parse_shell(raw: &str) -> out::Shell {
     let mut title = String::new();
     let mut subtitle = String::new();
+    let mut landing = String::new();
     let mut theme_roots = Vec::new();
     for line in raw.lines() {
         if let Some(v) = line.strip_prefix("title: ") {
             title = unquote(v.trim());
         } else if let Some(v) = line.strip_prefix("subtitle: ") {
             subtitle = unquote(v.trim());
+        } else if let Some(v) = line.strip_prefix("landing: ") {
+            landing = unquote(v.trim());
         } else if let Some(v) = line.strip_prefix("theme_root: ") {
             theme_roots.push(v.trim().to_string());
         }
@@ -527,6 +531,7 @@ fn parse_shell(raw: &str) -> out::Shell {
     out::Shell {
         title,
         subtitle,
+        landing,
         theme_roots,
     }
 }
@@ -692,6 +697,19 @@ mod tests {
         assert_eq!(shell.title, "RPC Authority");
         assert_eq!(shell.theme_roots, ["files/cdn.jsdelivr.net/gh/x/style.css"]);
         // And it re-serializes losslessly through the v2 writer.
+        assert_eq!(shell.to_text(), raw);
+    }
+
+    #[test]
+    fn shell_parses_v2_file_with_landing() {
+        let raw = concat!(
+            "title: \"Kumawa\"\n",
+            "subtitle: \"\"\n",
+            "landing: \"blog:_start\"\n",
+            "theme_root: http://kumawa.wdfiles.com/local--code/theme/1.css\n",
+        );
+        let shell = parse_shell(raw);
+        assert_eq!(shell.landing, "blog:_start");
         assert_eq!(shell.to_text(), raw);
     }
 }

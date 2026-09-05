@@ -406,10 +406,10 @@ async fn file_fetch(
 const SHELL_KEY: &str = "shell";
 const THEME_CRAWLED_KEY: &str = "theme.crawled";
 
-/// Refresh the site shell (title / subtitle / theme roots) from the
-/// homepage. The homepage GET doubles as a CSRF warmup for a cold session.
-/// Roots are compared against the last completed theme crawl's marker:
-/// changed roots (or a crawl that ended with failures) enqueue
+/// Refresh the site shell (title / subtitle / landing / theme roots) from
+/// the homepage. The homepage GET doubles as a CSRF warmup for a cold
+/// session. Roots are compared against the last completed theme crawl's
+/// marker: changed roots (or a crawl that ended with failures) enqueue
 /// `theme.crawl`; a themeless site never crawls.
 async fn shell_sync(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome, FetchError> {
     let site = api.site.as_str();
@@ -417,10 +417,12 @@ async fn shell_sync(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome,
     let (_page_title, _tags, _page_id, html) = api.fetch_page(&Slug::parse("")).await?;
     let title = parsers::extract_site_title(&html);
     let subtitle = parsers::extract_site_subtitle(&html);
+    let landing = parsers::extract_landing_slug(&html).unwrap_or_default();
     let theme_roots = parsers::plan_theme_roots(&html);
     let shell = out::Shell {
         title,
         subtitle,
+        landing,
         theme_roots: theme_roots.clone(),
     };
 
@@ -446,7 +448,7 @@ async fn shell_sync(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome,
 
     let payload = serde_json::to_string(&shell)
         .map_err(|e| FetchError::Http(format!("shell encode: {e}")))?;
-    tracing::info!(site, roots = theme_roots.len(), needs_crawl, "shell synced");
+    tracing::info!(site, landing = %shell.landing, roots = theme_roots.len(), needs_crawl, "shell synced");
     let effects: Effects = Box::new(move |tx| {
         tx.execute(
             "INSERT INTO meta(key, value) VALUES(?1, ?2)

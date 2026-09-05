@@ -9,8 +9,8 @@
 //!   drifts from `out_state.packed_revs`.
 //! - `pages.json` / `files.json` — deterministic manifests (stable ordering,
 //!   write-if-changed so untouched publications don't churn bytes).
-//! - `shell` — site title/subtitle/theme-roots (v1 format), written by
-//!   `shell.sync`.
+//! - `shell` — site title/subtitle/landing/theme-roots (v1 format plus a
+//!   `landing` line), written by `shell.sync`.
 //!
 //! Determinism: tar headers carry mtime 0 / uid 0 / gid 0 / mode 0644, GNU
 //! format, entries in rev_no order, and the zstd stream is single-threaded —
@@ -315,22 +315,31 @@ fn write_if_changed(dest: &Path, bytes: &[u8]) -> Result<bool> {
 
 // ── Site shell ──
 
-/// The site's display identity (v1 `meta.Shell`). `theme_roots` are the
-/// custom-theme @import entry points (base theme filtered off) — recorded
-/// here, evacuation of the theme graph is a separate concern.
+/// The site's display identity (v1 `meta.Shell` + landing). `theme_roots`
+/// are the custom-theme @import entry points (base theme filtered off) —
+/// recorded here, evacuation of the theme graph is a separate concern.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct Shell {
     pub title: String,
     pub subtitle: String,
+    /// Landing page slug — the page the site root serves. Empty when
+    /// unknown (v1 imports carry no landing; `shell.sync` fills it in).
+    #[serde(default)]
+    pub landing: String,
     pub theme_roots: Vec<String>,
 }
 
 impl Shell {
-    /// v1 `format_shell`: YAML-ish lines, theme_root raw (unquoted URL).
+    /// v1 `format_shell` shape: YAML-ish lines, theme_root raw (unquoted
+    /// URL). `landing` is a v2 addition, emitted only when known so v1
+    /// files round-trip byte-identically.
     pub fn to_text(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("title: {}\n", yaml_quote(&self.title)));
         s.push_str(&format!("subtitle: {}\n", yaml_quote(&self.subtitle)));
+        if !self.landing.is_empty() {
+            s.push_str(&format!("landing: {}\n", yaml_quote(&self.landing)));
+        }
         for root in &self.theme_roots {
             s.push_str(&format!("theme_root: {root}\n"));
         }
@@ -403,6 +412,7 @@ mod tests {
         let shell = Shell {
             title: "La AGIAT".into(),
             subtitle: "Archivo de terror".into(),
+            landing: "blog:_start".into(),
             theme_roots: vec!["http://agiat.wdfiles.com/local--code/theme/1.css".into()],
         };
         assert_eq!(
@@ -410,9 +420,22 @@ mod tests {
             concat!(
                 "title: \"La AGIAT\"\n",
                 "subtitle: \"Archivo de terror\"\n",
+                "landing: \"blog:_start\"\n",
                 "theme_root: http://agiat.wdfiles.com/local--code/theme/1.css\n",
             )
         );
+    }
+
+    #[test]
+    fn shell_without_landing_omits_the_line() {
+        // v1 files carry no landing; re-serializing them must not grow one.
+        let shell = Shell {
+            title: "T".into(),
+            subtitle: String::new(),
+            landing: String::new(),
+            theme_roots: vec![],
+        };
+        assert_eq!(shell.to_text(), "title: \"T\"\nsubtitle: \"\"\n");
     }
 
     #[test]

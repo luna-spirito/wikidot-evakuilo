@@ -184,11 +184,24 @@ const RETUNE_PRIORITIES_V4: &str = r#"
 UPDATE jobs SET priority=18 WHERE kind='out.update';
 "#;
 
+/// v5: the shell gained `landing` (the slug the site root serves). The
+/// homepage HTML is never persisted, so landing is only observable by a
+/// live GET — existing sites must re-run `shell.sync` once instead of
+/// waiting out their `shell_interval_s`. Pull the singleton's next
+/// scheduled run to "now". `running` rows need no touch: a live one is
+/// mid-rewrite already, a stale one is recovered to `pending` with a past
+/// `run_at` (it was due when claimed), so it is claimable either way.
+/// `priority` is untouched — v3 already seated shell.sync at the top.
+const REARM_SHELL_SYNC_V5: &str = r#"
+UPDATE jobs SET run_at=0 WHERE kind='shell.sync' AND status='pending';
+"#;
+
 const MIGRATIONS: &[&str] = &[
     SCHEMA_V1,
     SCHEMA_V2,
     RETUNE_PRIORITIES_V3,
     RETUNE_PRIORITIES_V4,
+    REARM_SHELL_SYNC_V5,
 ];
 
 // ── Job types ──
@@ -978,6 +991,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(prio, crate::jobs::prio::OUT);
+    }
+
+    /// v5 must pull a seated shell.sync's next run to "now" (run_at=0) so
+    /// every existing site re-fetches its homepage and gains a `landing`
+    /// — and must leave every other schedule alone.
+    #[test]
+    fn v5_rearms_shell_sync_only() {
+        let (_d, db, _l) = site("rearm5");
+        let far = now() + 86_400;
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO jobs(kind, payload, run_at, created_at) VALUES
+                 ('shell.sync', '{}', ?1, ?1),
+                 ('out.update', '{}', ?1, ?1)",
+                params![far],
+            )
+            .unwrap();
+            conn.execute_batch(REARM_SHELL_SYNC_V5).unwrap();
+        });
+        let run_at = |kind: &str| {
+            db.with_conn(|c| {
+                c.query_row(
+                    "SELECT run_at FROM jobs WHERE kind=?1",
+                    params![kind],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap()
+        };
+        assert_eq!(run_at("shell.sync"), 0);
+        assert_eq!(run_at("out.update"), far);
     }
 
     #[test]
