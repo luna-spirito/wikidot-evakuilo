@@ -36,6 +36,7 @@ pub struct ImportStats {
     pub revisions_content: usize,
     pub files: usize,
     pub blobs_linked: usize,
+    pub file_refs: usize,
     pub revision_jobs: usize,
     pub watermark: bool,
     pub shell: bool,
@@ -63,12 +64,13 @@ pub fn run(cfg: &Config, from: &Path) -> Result<()> {
             import_site(cfg, &site_dir, site).with_context(|| format!("importing {site}"))?;
         println!(
             " {} pages, {} revisions ({} with content), {} files ({} blobs linked), \
-             {} revision jobs, watermark={}, shell={}",
+             {} wikitext file refs, {} revision jobs, watermark={}, shell={}",
             stats.pages,
             stats.revisions_meta,
             stats.revisions_content,
             stats.files,
             stats.blobs_linked,
+            stats.file_refs,
             stats.revision_jobs,
             stats.watermark,
             stats.shell
@@ -89,6 +91,8 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
     // 1. Journals → pages + revision metas.
     let mut stats = ImportStats::default();
     let mut jobs_to_enqueue: Vec<NewJob> = Vec::new();
+    // File references mined from imported wikitext (see step 4a).
+    let mut file_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
     db.with_conn(|conn| {
         let tx = conn.transaction().map_err(anyhow::Error::from)?;
 
@@ -134,6 +138,12 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
             let raw = std::fs::read_to_string(&txt)?;
             let fm = parse_frontmatter(&raw)
                 .with_context(|| format!("frontmatter in {}", txt.display()))?;
+            // The legacy tree's files/ view never covered wikitext
+            // references (v1 shared the same blind spot); mine them here so
+            // step 4a can seed the missing rows.
+            for path in crate::parsers::extract_file_links(site, &fm.body) {
+                file_refs.insert(path);
+            }
             if fm.page_id != page_id {
                 bail!(
                     "{}: frontmatter page_id {} != dir {}",
@@ -219,8 +229,9 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
             };
             segments.remove(0);
             let url_path = segments.join("/");
-            // Reconstruct the absolute URL, then share the crawler's
-            // own-host → site-relative path mapping.
+            // Reconstruct the absolute URL, then share the extractor's
+            // canonical-URL mapping (one absolute key per file, no matter
+            // which host spelling the legacy tree stored it under).
             let full_url = format!("https://{host}/{url_path}");
             let (path, url) = crate::parsers::file_row_paths(site, &full_url);
             let target = std::fs::read_link(&link)?;
@@ -309,6 +320,23 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
                 rusqlite::params![path, url, sha, size, db::now(), db::now(), content_type],
             )?;
             stats.files += 1;
+        }
+
+        // 4a. Wikitext-referenced files the legacy tree never archived:
+        //     pending rows for everything mined in step 2 that step 4 didn't
+        //     already cover with a local blob. Step 4b below arms the fetch
+        //     jobs. Without this, the rows would only appear via revision
+        //     fetches — which skip revisions the import stored content for.
+        {
+            let mut refs: Vec<&String> = file_refs.iter().collect();
+            refs.sort();
+            for path in refs {
+                stats.file_refs +=
+                    tx.execute(
+                        "INSERT OR IGNORE INTO files(path, first_seen) VALUES(?1, ?2)",
+                        rusqlite::params![path, db::now()],
+                    )?;
+            }
         }
 
         // 4b. Files left 'pending' (hand-placed, non-sharded legacy blobs —
@@ -603,8 +631,9 @@ fn r_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Every symlink under `files/` (sorted). A site whose legacy tree has no
-/// `files/` view has no importable attachment mapping — imports as zero
-/// rows; the wikitext backfill re-discovers those files live.
+/// `files/` view has no importable attachment mapping — it imports as zero
+/// legacy rows, and step 4a re-discovers the references from the imported
+/// wikitext instead.
 fn symlink_tree(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         return Ok(Vec::new());

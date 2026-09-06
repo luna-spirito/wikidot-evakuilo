@@ -217,15 +217,23 @@ impl<'a> SiteApi<'a> {
                 .await
             })
             .await?;
-        Ok(parsers::extract_page_files(&body))
+        Ok(parsers::extract_page_files(&self.site, &body))
     }
 
-    /// Fetch an attachment: (bytes, media type). The media type is the
-    /// server's Content-Type sans parameters, or None when it sent nothing
-    /// usable — callers fall back to sniffing.
-    pub async fn fetch_attachment(&self, path: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
-        let url = format!("{}/{path}", self.base());
-        self.retryable(&format!("attachment {path}"), || async {
+    /// Fetch an attachment: (bytes, media type). `path_or_url` is the
+    /// canonical absolute row URL (`http://{site}.wikidot.com/…`, which
+    /// 302s to wdfiles server-side); a site-relative path still works
+    /// (pre-v6 stragglers) and lifts onto the main domain. Session cookies
+    /// ride along — this is the site's own namespace. The media type is
+    /// the server's Content-Type sans parameters, or None when it sent
+    /// nothing usable — callers fall back to sniffing.
+    pub async fn fetch_attachment(&self, path_or_url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
+        let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+            path_or_url.to_string()
+        } else {
+            format!("{}/{path_or_url}", self.base())
+        };
+        self.retryable(&format!("attachment {path_or_url}"), || async {
             let resp = self.wik.get(&self.site, &url).await?;
             let content_type = media_type(resp.headers());
             let bytes = resp

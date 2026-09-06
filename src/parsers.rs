@@ -186,34 +186,72 @@ fn is_absolute_url(s: &str) -> bool {
     s.contains("://") || s.starts_with("data:")
 }
 
-// ── URL → files-row mapping (shared by the legacy importer and the theme
-//    crawl) ──
+// ── URL → files-row mapping (shared by the legacy importer, the theme
+//    crawl and wikitext extraction) ──
 
-/// Map an absolute URL to its `(path, url)` files-row pair: URLs on the
-/// site's own Wikidot hosts (`{site}.wdfiles.com`, `{site}.wikidot.com`)
-/// become site-relative paths fetched via the main site domain; anything
-/// else keeps its full URL as both path and fetch target.
+/// Map a URL to its `(path, url)` files-row pair. `path` is the canonical
+/// row key — always an absolute URL, and for anything Wikidot operates
+/// always `http://{slug}.wikidot.com/…`: Wikidot serves one file namespace
+/// per site under several host spellings (`{slug}.wikidot.com` 302s to
+/// `{slug}.wdfiles.com`; `www.` prefixes and `https` work too — verified
+/// live, identical final URLs), so they all collapse onto one spelling and
+/// references written differently stop creating duplicate rows. `url` is
+/// the origin the bytes came (or would come) from, kept verbatim.
 pub fn file_row_paths(site: &str, url: &str) -> (String, String) {
     match url::Url::parse(url) {
-        Ok(u) => {
-            let own = u.host_str().is_some_and(|h| {
-                h.eq_ignore_ascii_case(&format!("{site}.wdfiles.com"))
-                    || h.eq_ignore_ascii_case(&format!("{site}.wikidot.com"))
-            }) && matches!(u.scheme(), "http" | "https");
-            if own {
-                // v1 folds the query into the leaf segment (`x.css?v=4`) so it
-                // stays one path component; `/` inside it is percent-encoded.
-                let mut p = u.path().trim_start_matches('/').to_string();
-                if let Some(q) = u.query().filter(|q| !q.is_empty()) {
-                    p = format!("{p}?{}", q.replace('/', "%2F"));
-                }
-                (p.clone(), format!("http://{site}.wikidot.com/{p}"))
-            } else {
-                (url.to_string(), url.to_string())
+        Ok(u) => match canonical_wikidot_url(site, &u) {
+            Some(canonical) => (canonical, url.to_string()),
+            None => {
+                let mut u = u;
+                u.set_fragment(None);
+                let verbatim = u.to_string();
+                (verbatim.clone(), verbatim)
             }
-        }
+        },
         Err(_) => (url.to_string(), url.to_string()),
     }
+}
+
+/// Canonical `http://{slug}.wikidot.com{path}?{query}` when `u` sits on a
+/// Wikidot-operated host: this site's own hosts, or any
+/// `{slug}.wikidot.com` / `{slug}.wdfiles.com` (cross-site references —
+/// sandboxes, sister wikis). `www.` prefixes are stripped (same namespace)
+/// and `%3A` in the path is decoded to the literal `:` — Wikidot page
+/// slugs are `category:name` and both spellings of the separator name the
+/// same file. Returns None for hosts Wikidot does not operate: CDNs and
+/// custom domains fronting a site keep their URL verbatim.
+fn canonical_wikidot_url(site: &str, u: &url::Url) -> Option<String> {
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = u.host_str()?.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let own = host == format!("{site}.wikidot.com") || host == format!("{site}.wdfiles.com");
+    let slug = if own {
+        site.to_string()
+    } else {
+        host.strip_suffix(".wikidot.com")
+            .filter(|s| !s.is_empty())
+            .or_else(|| host.strip_suffix(".wdfiles.com").filter(|s| !s.is_empty()))?
+            .to_string()
+    };
+    let mut out = format!("http://{slug}.wikidot.com{}", decode_colons(u.path()));
+    if let Some(q) = u.query().filter(|q| !q.is_empty()) {
+        out.push('?');
+        out.push_str(q);
+    }
+    Some(out)
+}
+
+/// Lowercased host of an absolute URL (None for relative paths / junk).
+pub(crate) fn url_host(s: &str) -> Option<String> {
+    url::Url::parse(s)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+}
+
+fn decode_colons(path: &str) -> String {
+    path.replace("%3A", ":").replace("%3a", ":")
 }
 
 // ── Page source (from PageSourceModule AJAX body) ──
@@ -330,8 +368,10 @@ pub fn extract_revisions(html: &str) -> Vec<ParsedRevision> {
 // ── Files ──
 
 /// Attachment paths from a PageFilesModule listing: every `a[href]`
-/// containing `local--files/`.
-pub fn extract_page_files(html: &str) -> Vec<String> {
+/// containing `local--files/`, as canonical absolute URLs (the listing may
+/// spell the host either way; own-site references lift onto the main
+/// domain).
+pub fn extract_page_files(site: &str, html: &str) -> Vec<String> {
     let doc = Html::parse_document(html);
     let s_a = match Selector::parse("a") {
         Ok(s) => s,
@@ -341,7 +381,7 @@ pub fn extract_page_files(html: &str) -> Vec<String> {
     let mut out = Vec::new();
     for a in doc.select(&s_a) {
         if let Some(href) = a.value().attr("href")
-            && let Some(path) = file_path_from_ref(href)
+            && let Some(path) = file_path_from_ref(site, href)
             && seen.insert(path.clone())
         {
             out.push(path);
@@ -351,17 +391,62 @@ pub fn extract_page_files(html: &str) -> Vec<String> {
 }
 
 /// `local--files/…` references inside wikitext source, deduped (v1
-/// `extract_file_links`).
-pub fn extract_file_links(content: &str) -> Vec<String> {
+/// `extract_file_links`), as canonical absolute URLs.
+///
+/// A reference preceded immediately by a `scheme://host/` prefix is
+/// absolute and canonicalizes through `file_row_paths`: hosts on this site
+/// and any other `{slug}.wikidot.com`/`{slug}.wdfiles.com` spelling fold
+/// onto `http://{slug}.wikidot.com`, every other host (CDNs, custom
+/// domains fronting a site) keeps its full URL. Bare references are
+/// site-relative and lift onto `http://{site}.wikidot.com` — so a row key
+/// always names exactly one file no matter how the wikitext spelled it.
+pub fn extract_file_links(site: &str, content: &str) -> Vec<String> {
+    let parts: Vec<&str> = content.split("local--files/").collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for rest in content.split("local--files/").skip(1) {
-        let path = format!("local--files/{}", take_until_stop(rest));
+    for pair in parts.windows(2) {
+        let taken = take_until_stop(pair[1]);
+        if taken.is_empty() {
+            continue;
+        }
+        let path = match absolute_base_before(pair[0]) {
+            Some(base) => file_row_paths(site, &format!("{base}/local--files/{taken}")).0,
+            None => own_file_url(site, &taken),
+        };
         if seen.insert(path.clone()) {
             out.push(path);
         }
     }
     out
+}
+
+/// If the text ending right before a `local--files/` occurrence is an
+/// `http(s)://host/` URL prefix, return `scheme://host` — the reference is
+/// absolute. Only web schemes qualify: wikitext typos like
+/// `[[=imagehttp://host/…` (missing space) would otherwise pass as the
+/// "scheme" `imagehttp` and jam the two URLs together. Anything else
+/// sitting between host and `local--files/` (a path segment, a space, …)
+/// also disqualifies: the reference is site-relative.
+fn absolute_base_before(prev: &str) -> Option<String> {
+    let pos = prev.rfind("://")?;
+    let scheme_start = prev[..pos]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '-' | '.'))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let scheme = &prev[scheme_start..pos];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let after = &prev[pos + 3..];
+    let (host, rest) = after.split_once('/').unwrap_or((after, ""));
+    let host_ok = !host.is_empty()
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
+    if !host_ok || !rest.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
 }
 
 // ── Helpers ──
@@ -440,21 +525,40 @@ fn rev_from_td(td: ElementRef) -> Option<i64> {
     cleaned.parse().ok()
 }
 
-/// Any string containing `local--files/…` → the canonical path, stopping at
-/// URL/quote delimiters (v1 `take_until_stop_char`).
-fn file_path_from_ref(href: &str) -> Option<String> {
-    let (_, rest) = href.split_once("local--files/")?;
+/// Any string containing `local--files/…` → the canonical URL, stopping at
+/// URL/quote delimiters (v1 `take_until_stop_char`). An absolute
+/// `scheme://host/` prefix right before the reference routes through
+/// `file_row_paths`; anything else (a leading `/`, bare name) is this
+/// site's namespace.
+fn file_path_from_ref(site: &str, href: &str) -> Option<String> {
+    let (prev, rest) = href.split_once("local--files/")?;
     let taken = take_until_stop(rest);
     if taken.is_empty() {
-        None
-    } else {
-        Some(format!("local--files/{taken}"))
+        return None;
     }
+    Some(match absolute_base_before(prev) {
+        Some(base) => file_row_paths(site, &format!("{base}/local--files/{taken}")).0,
+        None => own_file_url(site, &taken),
+    })
+}
+
+/// Canonical URL of a site-relative `local--files/…` tail: lifted onto the
+/// main domain and pushed through the same canonicalization as absolute
+/// references, so a `%3A`-spelled slug converges with its `:` twin.
+fn own_file_url(site: &str, tail: &str) -> String {
+    file_row_paths(site, &format!("http://{site}.wikidot.com/local--files/{tail}")).0
 }
 
 fn take_until_stop(s: &str) -> String {
+    // `|` stops too: it separates wikitext arguments
+    // (`…name=x.png|align=center`), never forms part of a URL path.
     s.chars()
-        .take_while(|c| !matches!(c, '"' | ' ' | '\n' | ')' | '>' | '\'' | ']' | '\\'))
+        .take_while(|c| {
+            !matches!(
+                c,
+                '"' | ' ' | '\n' | ')' | '>' | '\'' | ']' | '\\' | '|'
+            )
+        })
         .collect()
 }
 
@@ -580,21 +684,131 @@ WIKIREQUEST.info.pageId = 1457213925;
 
     #[test]
     fn file_links() {
-        let src = "[[image 9992.jpg]] http://site/local--files/page/Photo (1).jpg [[/image]] and local--files/x/a.png\" end";
-        let links = extract_file_links(src);
-        // path with space + parens stops at ' ', the quoted one at '"'
+        let src = concat!(
+            r#"[[image 9992.jpg]] rel local--files/page/Photo (1).jpg [[/image]] and "#,
+            r#"own http://mywiki.wdfiles.com/local--files/x/a.png or "#,
+            r#"foreign [http://sandbox.wikidot.com/local--files/p/c.png|caption] "#,
+            r#"not-a-host-prefix http://other.wikidot.com/zap local--files/w/u.png" end"#
+        );
+        let links = extract_file_links("mywiki", src);
+        // Every reference is a canonical absolute URL: bare and own-host
+        // spellings lift/collapse onto the main domain, a foreign wikidot
+        // host keeps its site, `|` ends a name, and a URL followed by more
+        // text does NOT prefix the next reference.
         assert_eq!(
             links,
             vec![
-                "local--files/page/Photo".to_string(),
-                "local--files/x/a.png".to_string()
+                "http://mywiki.wikidot.com/local--files/page/Photo".to_string(),
+                "http://mywiki.wikidot.com/local--files/x/a.png".to_string(),
+                "http://sandbox.wikidot.com/local--files/p/c.png".to_string(),
+                "http://mywiki.wikidot.com/local--files/w/u.png".to_string(),
             ]
         );
-        let listing =
-            r#"<a href="http://rpcauthority.wikidot.com/local--files/rpc-001/cover.jpg">cover</a>"#;
+        let listing = concat!(
+            r#"<a href="/local--files/rpc-001/cover.jpg">cover</a>"#,
+            r#"<a href="http://rpcauthority.wikidot.com/local--files/rpc-001/cover.jpg">dup</a>"#,
+        );
         assert_eq!(
-            extract_page_files(listing),
-            vec!["local--files/rpc-001/cover.jpg"]
+            extract_page_files("rpcauthority", listing),
+            vec!["http://rpcauthority.wikidot.com/local--files/rpc-001/cover.jpg".to_string()]
+        );
+    }
+
+    /// One file, many spellings — all Wikidot-operated host variants
+    /// collapse to `http://{slug}.wikidot.com`; hosts Wikidot does not
+    /// operate keep their URL (fragment dropped).
+    #[test]
+    fn canonical_urls_collapse_wikidot_host_spellings() {
+        let key = |u: &str| file_row_paths("rpcauthority", u).0;
+        let own = "http://rpcauthority.wikidot.com/local--files/rpc-1/a.jpg";
+        assert_eq!(key("http://rpcauthority.wikidot.com/local--files/rpc-1/a.jpg"), own);
+        assert_eq!(key("https://rpcauthority.wdfiles.com/local--files/rpc-1/a.jpg"), own);
+        assert_eq!(key("http://www.rpcauthority.wikidot.com/local--files/rpc-1/a.jpg#x"), own);
+        assert_eq!(
+            key("http://RPCSANDBOX.wdfiles.com/local--files/component%3Atheme/x.css"),
+            "http://rpcsandbox.wikidot.com/local--files/component:theme/x.css"
+        );
+        assert_eq!(
+            key("https://cdn.jsdelivr.net/gh/x/style.css"),
+            "https://cdn.jsdelivr.net/gh/x/style.css"
+        );
+        // A custom domain fronting a site is NOT Wikidot-operated: verbatim.
+        assert_eq!(
+            key("http://www.rpc-wiki.net/local--files/rpc-1/a.jpg?v=2"),
+            "http://www.rpc-wiki.net/local--files/rpc-1/a.jpg?v=2"
+        );
+        // The pair's second element keeps the original spelling (fetch
+        // provenance) with the fragment stripped.
+        assert_eq!(
+            file_row_paths("s", "http://x.test/a.css#frag"),
+            ("http://x.test/a.css".to_string(), "http://x.test/a.css".to_string())
+        );
+        assert_eq!(
+            file_row_paths("s", "https://s.wdfiles.com/local--code/theme/1.css").1,
+            "https://s.wdfiles.com/local--code/theme/1.css"
+        );
+        // Query survives canonicalization (cache-busted theme CSS).
+        assert_eq!(
+            key("http://s.wdfiles.com/local--code/theme/1.css?v=4"),
+            "http://s.wikidot.com/local--code/theme/1.css?v=4"
+        );
+    }
+
+    #[test]
+    fn file_links_pipe_arguments_do_not_leak_into_names() {
+        let src = r#"[[include component:image-block name=http://sandbox.wdfiles.com/local--files/hydrozen-sandbox/01.png|align=center|width=660px|caption=RPC-001.]]"#;
+        assert_eq!(
+            extract_file_links("rpcauthority", src),
+            vec!["http://sandbox.wikidot.com/local--files/hydrozen-sandbox/01.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn absolute_base_before_requires_bare_host() {
+        assert_eq!(
+            absolute_base_before("see http://rpcsandbox.wdfiles.com/"),
+            Some("http://rpcsandbox.wdfiles.com".to_string())
+        );
+        assert_eq!(
+            absolute_base_before("see https://rpcsandbox.wdfiles.com"),
+            Some("https://rpcsandbox.wdfiles.com".to_string())
+        );
+        // path segment between host and the reference → not a prefix
+        assert_eq!(absolute_base_before("see http://x.wikidot.com/page "), None);
+        // no scheme at all
+        assert_eq!(absolute_base_before("[[image "), None);
+    }
+
+    /// `[[=imagehttp://host/…` — the author forgot the space after the
+    /// image element. `imagehttp` must not pass as a URL scheme (that
+    /// jams two URLs into one path); the reference reads as site-relative,
+    /// which for an own-host typo is exactly the intended file.
+    #[test]
+    fn typo_jammed_urls_do_not_become_schemes() {
+        let src = "[[=imagehttp://rpcauthority.wdfiles.com/local--files/two-sides/due.jpg]";
+        assert_eq!(
+            extract_file_links("rpcauthority", src),
+            vec![
+                "http://rpcauthority.wikidot.com/local--files/two-sides/due.jpg".to_string()
+            ]
+        );
+        assert_eq!(absolute_base_before("[[=imagehttp://x.wdfiles.com/"), None);
+    }
+
+    /// Relative references spelled with `%3A` converge with their `:`
+    /// twins — one canonical key per file regardless of spelling.
+    #[test]
+    fn relative_refs_decode_percent_colons() {
+        assert_eq!(
+            extract_file_links("demo", "img local--files/nav%3Aside/discord.png"),
+            vec!["http://demo.wikidot.com/local--files/nav:side/discord.png".to_string()]
+        );
+        assert_eq!(
+            extract_page_files(
+                "demo",
+                r#"<a href="/local--files/component%3Atheme/x.css">t</a>"#
+            ),
+            vec!["http://demo.wikidot.com/local--files/component:theme/x.css".to_string()]
         );
     }
 

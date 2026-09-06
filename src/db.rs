@@ -38,14 +38,14 @@
 
 use std::{
     fs::File,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 /// Unix time, seconds. Queue granularity never needs finer.
@@ -196,13 +196,251 @@ const REARM_SHELL_SYNC_V5: &str = r#"
 UPDATE jobs SET run_at=0 WHERE kind='shell.sync' AND status='pending';
 "#;
 
-const MIGRATIONS: &[&str] = &[
-    SCHEMA_V1,
-    SCHEMA_V2,
-    RETUNE_PRIORITIES_V3,
-    RETUNE_PRIORITIES_V4,
-    REARM_SHELL_SYNC_V5,
+// ── v6: file-reference repair (see `repair_files_v6`) ──
+
+/// Context for Rust repair steps: the site's name (own-host classification
+/// when re-running extraction) and its `out/` dir (blob GC). Derived from
+/// the DB path per the layout contract `config.rs` documents:
+/// `{repo}/meta/{site}/site.db` ↔ `{repo}/out/{site}`.
+pub(crate) struct RepairCtx {
+    pub site: String,
+    pub out_dir: PathBuf,
+}
+
+/// One schema step. SQL covers what SQL can say; repairs are Rust data
+/// surgery inside the same transaction (v6 re-parses wikitext, which SQL
+/// cannot). Repairs may collect orphaned blob shas for post-commit unlink.
+enum Migration {
+    Sql(&'static str),
+    Repair(fn(&Transaction, &RepairCtx, &mut Vec<String>) -> Result<()>),
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration::Sql(SCHEMA_V1),
+    Migration::Sql(SCHEMA_V2),
+    Migration::Sql(RETUNE_PRIORITIES_V3),
+    Migration::Sql(RETUNE_PRIORITIES_V4),
+    Migration::Sql(REARM_SHELL_SYNC_V5),
+    Migration::Repair(repair_files_v6),
 ];
+
+/// v6: file references mined from wikitext were defective twice over —
+/// `extract_file_links` dropped the host of absolute references (an
+/// off-site asset — a sandbox, a sister wiki — was silently re-pointed at
+/// THIS site, where it soft-404'd into a saved HTML error page or fetched
+/// an unrelated same-named file) and leaked `|` argument separators /
+/// trailing garbage into paths. The repair, all in one transaction:
+///
+/// * garbage paths (`…|caption=`, site-relative refs with no page/name
+///   split) are deleted, along with their pending fetch jobs;
+/// * rows "saved" as `text/html` — Wikidot never serves attachments as
+///   HTML, every one is an error page — reset to `pending` with the blob
+///   fields cleared, so the fixed fetcher records a truthful `missing`
+///   (or re-saves a genuinely re-fetchable file);
+/// * link extraction re-runs over every stored revision with the fixed
+///   parser, seeding the correct rows as pending — no `revision.fetch`
+///   backfill is needed, which is lucky because those fast-path skip
+///   revisions that already have content;
+/// * every row key is canonicalized to an absolute URL: site-relative
+///   rows lift onto `http://{site}.wikidot.com`, and the broken era's
+///   off-site rows were stored under whichever host spelling the wikitext
+///   used (`…wdfiles.com`, `www.…`, `https`) even though Wikidot serves
+///   all of them from one namespace — duplicate keys for one file merge
+///   into the row carrying the most state (saved over missing over
+///   pending), and fetch jobs keyed on a dead spelling are deleted;
+/// * fetch jobs are armed for every pending row (`resurrect`, so the
+///   done/dead tombstones the broken era burned re-arm instead of
+///   swallowing the enqueue);
+/// * the junk blobs are unlinked after commit (a rollback must never cost
+///   a live row its bytes), guarded by a final reference check.
+///
+/// Idempotent by construction (deletes match nothing twice, `INSERT OR
+/// IGNORE` re-seeds nothing), though the version bump means it runs once.
+fn repair_files_v6(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    // Junk paths go with their queued jobs: a stale pending job would
+    // re-create its row (as a junk `missing`) on the next run.
+    let junk_paths: BTreeSet<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT path FROM files
+              WHERE path LIKE '%|%'
+                 OR path = 'local--files/'
+                 OR (path LIKE 'local--files/%' AND path NOT LIKE 'local--files/%/%')",
+        )?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    // GC candidates while the rows still carry their shas.
+    {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT sha256 FROM files
+              WHERE status='saved' AND content_type='text/html'",
+        )?;
+        let shas: Vec<Option<String>> =
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        orphans.extend(shas.into_iter().flatten());
+    }
+
+    let mut junk_rows = 0usize;
+    let mut junk_jobs = 0usize;
+    if !junk_paths.is_empty() {
+        let ph_paths = vec!["?"; junk_paths.len()].join(",");
+        junk_rows = tx.execute(
+            &format!("DELETE FROM files WHERE path IN ({ph_paths})"),
+            params_from_iter(junk_paths.iter()),
+        )?;
+        // jobs dedupe on (kind, payload); the payload is exactly
+        // `{"path":"…"}` — rebuild it rather than pattern-matching JSON.
+        let payloads: Vec<String> = junk_paths
+            .iter()
+            .map(|p| serde_json::json!({ "path": p }).to_string())
+            .collect();
+        junk_jobs = tx.execute(
+            &format!(
+                "DELETE FROM jobs
+                  WHERE kind='file.fetch' AND status='pending'
+                    AND payload IN ({})",
+                vec!["?"; payloads.len()].join(",")
+            ),
+            params_from_iter(payloads.iter()),
+        )?;
+    }
+
+    let html_reset = tx.execute(
+        "UPDATE files
+            SET status='pending', sha256=NULL, size=NULL, content_type=NULL, saved_at=NULL
+          WHERE status='saved' AND content_type='text/html'",
+        [],
+    )?;
+
+    // The union of file references across ALL stored revisions — the
+    // evacuation set — not just page heads. Extraction already yields
+    // canonical absolute URLs.
+    let mut refs: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = tx.prepare("SELECT content FROM revisions WHERE content IS NOT NULL")?;
+        let rows: Vec<String> =
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for content in rows {
+            for path in crate::parsers::extract_file_links(&ctx.site, &content) {
+                refs.insert(path);
+            }
+        }
+    }
+    let mut seeded = 0usize;
+    for path in refs.into_iter().collect::<BTreeSet<_>>() {
+        seeded += tx.execute(
+            "INSERT OR IGNORE INTO files(path, first_seen) VALUES(?1, ?2)",
+            params![path, now()],
+        )?;
+    }
+
+    // Canonicalize the remaining (pre-v6) keys and merge the duplicates
+    // the host spellings created. Groups keyed by canonical path; the
+    // survivor is the member carrying the most state (saved > missing >
+    // pending, ties by path order for determinism); losers are deleted
+    // and, when their blob differs from the survivor's, queued for GC.
+    let mut lifted = 0usize;
+    let mut merged = 0usize;
+    {
+        let mut stmt = tx.prepare("SELECT path, status, sha256 FROM files ORDER BY path")?;
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let rank = |s: &str| if s == "saved" { 2 } else if s == "missing" { 1 } else { 0 };
+        let mut groups: BTreeMap<String, Vec<(String, String, Option<String>)>> = BTreeMap::new();
+        for (path, status, sha) in rows {
+            groups
+                .entry(canonical_row_key(&ctx.site, &path))
+                .or_default()
+                .push((path, status, sha));
+        }
+        for (canonical, mut members) in groups {
+            members.sort_by_key(|a| std::cmp::Reverse(rank(&a.1)));
+            let survivor_sha = members[0].2.clone();
+            for (path, status, sha) in &members[1..] {
+                tx.execute("DELETE FROM files WHERE path=?1", params![path])?;
+                merged += 1;
+                if status == "saved" && *sha != survivor_sha {
+                    orphans.extend(sha.iter().cloned());
+                }
+            }
+            let old_path = &members[0].0;
+            if old_path != &canonical {
+                tx.execute(
+                    "UPDATE files SET path=?1 WHERE path=?2",
+                    params![canonical, old_path],
+                )?;
+                lifted += 1;
+            }
+            // Fetch jobs keyed on a non-canonical spelling die with it: a
+            // stale pending job would re-create its old row on the next
+            // run, and a stale tombstone only blocks nothing. The re-arm
+            // step below re-creates the jobs that matter (pending rows,
+            // fresh attempt budget); terminal rows need none.
+            for (path, _, _) in &members {
+                if path != &canonical {
+                    let payload = serde_json::json!({ "path": path }).to_string();
+                    tx.execute(
+                        "DELETE FROM jobs WHERE kind='file.fetch' AND payload=?1",
+                        params![payload],
+                    )?;
+                }
+            }
+        }
+    }
+
+    // Arm fetches for every pending row — the freshly seeded references,
+    // the reset soft-404 rows and the merged survivors whose own fetch
+    // never ran. `resurrect` re-arms the done/dead jobs the broken era
+    // already burned (pending/running rows are left alone, as ever); the
+    // periodic backfill would do the same within its interval, this just
+    // doesn't make the repair wait for it.
+    let mut stmt = tx.prepare("SELECT path FROM files WHERE status='pending'")?;
+    let pending: Vec<String> =
+        stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let jobs: Vec<NewJob> = pending
+        .iter()
+        .map(|path| {
+            let mut j = crate::jobs::file_fetch(path);
+            j.resurrect = true;
+            j
+        })
+        .collect();
+    enqueue_on(tx, &jobs)?;
+
+    tracing::info!(
+        site = %ctx.site,
+        junk_paths = junk_paths.len(),
+        junk_rows,
+        junk_jobs,
+        html_reset,
+        file_refs = seeded,
+        lifted,
+        merged,
+        "v6 file-reference repair"
+    );
+    Ok(())
+}
+
+/// Canonical files-row key for an existing row: a site-relative path lifts
+/// onto the main domain — then through the same canonicalization as any
+/// freshly extracted reference, so an old `%3A`-spelled slug converges with
+/// its `:` twin instead of forking a duplicate row; an absolute URL
+/// canonicalizes directly (Wikidot host spellings collapse, everything
+/// else stays verbatim).
+fn canonical_row_key(site: &str, path: &str) -> String {
+    let lifted = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("http://{site}.wikidot.com/{path}")
+    };
+    crate::parsers::file_row_paths(site, &lifted).0
+}
 
 // ── Job types ──
 
@@ -296,14 +534,13 @@ impl Db {
             .context("setting busy_timeout")?;
         let db = Db(Arc::new(Mutex::new(conn)));
         if !read_only {
-            db.migrate().context("migrating schema")?;
+            db.migrate(&repair_ctx_for(path)).context("migrating schema")?;
         }
         Ok(db)
     }
 
     /// Daemon entry point: open + take the site lock + recover stale jobs.
-    pub fn open_locked(path: &Path) -> Result<(Db, DaemonLock)> {
-        let lock_path = path
+    pub fn open_locked(path: &Path) -> Result<(Db, DaemonLock)> {        let lock_path = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("daemon.lock");
@@ -326,7 +563,7 @@ impl Db {
         Ok((db, DaemonLock(lock)))
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn migrate(&self, ctx: &RepairCtx) -> Result<()> {
         let mut conn = self.0.lock();
         let tx = conn.transaction()?;
         let version: i64 = if !has_table(&tx, "meta") {
@@ -341,15 +578,42 @@ impl Db {
             .map(|v: String| v.parse().unwrap_or(0))
             .unwrap_or(0)
         };
+        // Blobs the applied repairs orphaned; unlinked after commit so a
+        // rollback can never strand a live row without its bytes.
+        let mut orphans: Vec<String> = Vec::new();
         for (i, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-            tx.execute_batch(migration)
-                .with_context(|| format!("applying migration v{}", i + 1))?;
+            match migration {
+                Migration::Sql(sql) => tx
+                    .execute_batch(sql)
+                    .with_context(|| format!("applying migration v{}", i + 1))?,
+                Migration::Repair(repair) => {
+                    repair(&tx, ctx, &mut orphans)
+                        .with_context(|| format!("applying migration v{}", i + 1))?;
+                }
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
                 params![(i + 1).to_string()],
             )?;
         }
         tx.commit()?;
+        // Best-effort junk-blob GC: an orphan left behind by a crash here is
+        // inert slack in the content-addressed store, never corruption —
+        // and the reference recheck keeps a racing re-save of the same sha
+        // from losing its blob to us.
+        for sha in orphans {
+            if sha.len() != 64 {
+                continue;
+            }
+            let live: i64 = conn.query_row(
+                "SELECT count(*) FROM files WHERE sha256=?1",
+                params![sha],
+                |r| r.get(0),
+            )?;
+            if live == 0 {
+                let _ = std::fs::remove_file(crate::blobs::blob_path(&ctx.out_dir, &sha));
+            }
+        }
         Ok(())
     }
 
@@ -723,6 +987,24 @@ impl Db {
             },
         })
     }
+}
+
+/// `{repo}/meta/{site}/site.db` → site name + `{repo}/out/{site}` for the
+/// Rust repair steps (the layout contract `config.rs` documents). Odd
+/// paths degrade: an empty site classifies every reference host as
+/// off-site, a bogus out dir just leaves blob GC a no-op.
+fn repair_ctx_for(db_path: &Path) -> RepairCtx {
+    let site_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let site = site_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let out_dir = site_dir
+        .parent()
+        .and_then(|meta_dir| meta_dir.parent())
+        .map(|repo| repo.join("out").join(&site))
+        .unwrap_or_else(|| PathBuf::from("out").join(&site));
+    RepairCtx { site, out_dir }
 }
 
 /// Insert jobs inside a transaction. Non-ephemeral kinds deduplicate on
@@ -1260,5 +1542,173 @@ mod tests {
             Path::new(conn.path().unwrap()).to_path_buf()
         };
         assert!(Db::open_locked(&path).is_err());
+    }
+
+    /// v6 must repair the broken-era files state: delete garbage paths
+    /// (and their pending jobs), reset soft-404 HTML rows to pending with
+    /// the blob fields cleared, re-seed extraction over stored revisions
+    /// (canonical absolute URLs), lift/merge every remaining key onto its
+    /// canonical URL, re-point the fetch jobs, arm them, and GC the junk
+    /// blob once no row references it.
+    #[test]
+    fn v6_repair_reextracts_resets_and_gcs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = repo.join("meta").join("demo").join("site.db");
+        let (db, _l) = Db::open_locked(&db_path).unwrap(); // fresh → all steps apply
+        let ctx = RepairCtx {
+            site: "demo".into(),
+            out_dir: repo.join("out").join("demo"),
+        };
+
+        const JUNK_SHA: &str = "eabe424dd70c56173c2cfcfe8ca6b328ef2077d6ce9b3243540148a2d76f20ab";
+        const GOOD_SHA: &str = "00000000000000000000000000000000000000000000000000000000000000ff";
+        let junk_payload = serde_json::json!({ "path": "local--files/q/d.jpg|width=5" }).to_string();
+        let dupe_payload =
+            serde_json::json!({ "path": "http://sandbox.wdfiles.com/local--files/m/x.png" })
+                .to_string();
+        db.with_conn(|conn| {
+            // Roll the schema back to v5 so the next migrate() replays v6.
+            conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO pages(page_id, slug, discovered_at) VALUES(1, 'p', ?1)",
+                params![now()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO revisions(page_id, rev_no, rev_id, ts, author, content, fetched_at)
+                 VALUES(1, 0, 'r', 1, 1, ?1, 1)",
+                params![concat!(
+                    "rel local--files/p/a.png ",
+                    "own http://demo.wdfiles.com/local--files/p/b.png ",
+                    "foreign http://sandbox.wikidot.com/local--files/p/c.png|caption=x ",
+                    "pipe local--files/q/d.jpg|width=5 ",
+                    "pct local--files/nav:side/discord.png",
+                )],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files(path, url, sha256, size, status, first_seen, saved_at, content_type) VALUES
+                 ('local--files/p/a.png', 'http://demo.wikidot.com/local--files/p/a.png',
+                  NULL, NULL, 'pending', ?1, NULL, NULL),
+                 ('local--files/sbx/c.png', 'http://demo.wikidot.com/local--files/sbx/c.png',
+                  ?2, 404, 'saved', ?1, ?1, 'text/html'),
+                 -- one file, two host spellings: saved bytes + a pending twin
+                 ('http://sandbox.wikidot.com/local--files/m/x.png',
+                  'https://sandbox.wikidot.com/local--files/m/x.png',
+                  ?3, 10, 'saved', ?1, ?1, 'image/png'),
+                 ('http://sandbox.wdfiles.com/local--files/m/x.png', NULL,
+                  NULL, NULL, 'pending', ?1, NULL, NULL),
+                 -- pre-v6 row spelled with %3A: must converge with the
+                 -- ':'-spelled reference the re-extraction seeds
+                 ('local--files/nav%3Aside/discord.png',
+                  'http://demo.wikidot.com/local--files/nav%3Aside/discord.png',
+                  ?3, 20, 'saved', ?1, ?1, 'image/png'),
+                 ('local--files/q/d.jpg|width=5', NULL, NULL, NULL, 'pending', ?1, NULL, NULL)",
+                params![now(), JUNK_SHA, GOOD_SHA],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs(kind, payload, status, created_at) VALUES
+                 ('file.fetch', ?1, 'pending', ?3),
+                 ('file.fetch', ?2, 'pending', ?3)",
+                params![junk_payload, dupe_payload, now()],
+            )
+            .unwrap();
+        });
+        // Blobs on disk: the junk one must be GC'd, the good one kept.
+        let junk_blob = crate::blobs::blob_path(&ctx.out_dir, JUNK_SHA);
+        let good_blob = crate::blobs::blob_path(&ctx.out_dir, GOOD_SHA);
+        for (blob, bytes) in [(junk_blob.clone(), b"<html>error page</html>".as_slice()), (good_blob.clone(), b"real png bytes")]
+        {
+            std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            std::fs::write(&blob, bytes).unwrap();
+        }
+
+        db.migrate(&ctx).unwrap();
+
+        db.with_conn(|conn| {
+            let status = |path: &str| {
+                conn.query_row(
+                    "SELECT status, sha256, content_type FROM files WHERE path=?1",
+                    params![path],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)),
+                )
+                .optional()
+                .unwrap()
+            };
+            // Own-site references (bare and own-host absolute) lift onto
+            // the main domain as absolute URLs.
+            assert_eq!(
+                status("http://demo.wikidot.com/local--files/p/a.png"),
+                Some(("pending".into(), None, None))
+            );
+            assert_eq!(
+                status("http://demo.wikidot.com/local--files/p/b.png"),
+                Some(("pending".into(), None, None))
+            );
+            // Off-site reference keeps its site, canonical wikidot host.
+            assert_eq!(
+                status("http://sandbox.wikidot.com/local--files/p/c.png"),
+                Some(("pending".into(), None, None))
+            );
+            // Pipe garbage stopped at '|' seeds the real path instead.
+            assert_eq!(
+                status("http://demo.wikidot.com/local--files/q/d.jpg"),
+                Some(("pending".into(), None, None))
+            );
+            // Soft-404 row reset to pending, blob fields cleared, lifted.
+            assert_eq!(
+                status("http://demo.wikidot.com/local--files/sbx/c.png"),
+                Some(("pending".into(), None, None))
+            );
+            // The two spellings of the sandbox file merged: the saved row
+            // survives under the canonical key, the pending twin is gone.
+            assert_eq!(
+                status("http://sandbox.wikidot.com/local--files/m/x.png"),
+                Some(("saved".into(), Some(GOOD_SHA.to_string()), Some("image/png".to_string())))
+            );
+            // The %3A-spelled legacy row converged with the ':'-spelled
+            // reference: one saved row, decoded key.
+            assert_eq!(
+                status("http://demo.wikidot.com/local--files/nav:side/discord.png"),
+                Some(("saved".into(), Some(GOOD_SHA.to_string()), Some("image/png".to_string())))
+            );
+            // The old keys are all gone…
+            for gone in [
+                "local--files/p/a.png",
+                "local--files/sbx/c.png",
+                "http://sandbox.wdfiles.com/local--files/m/x.png",
+                "local--files/nav%3Aside/discord.png",
+                "local--files/q/d.jpg|width=5",
+            ] {
+                assert_eq!(status(gone), None, "{gone} should be gone");
+            }
+            // …and no file.fetch payload references a non-canonical path:
+            // the junk job died with its row, the dupe re-pointed.
+            let stale: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM jobs WHERE kind='file.fetch' AND payload IN
+                       (?1, ?2)",
+                    params![junk_payload, dupe_payload],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stale, 0);
+            // Every pending row carries an armed fetch job with its
+            // canonical payload.
+            let armed: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM jobs WHERE kind='file.fetch' AND status='pending'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(armed, 5); // a, b, c.png, d.jpg, sbx/c.png (reset)
+        });
+        // Junk blob GC'd now that nothing references its sha; good one kept.
+        assert!(!junk_blob.exists());
+        assert!(good_blob.exists());
     }
 }

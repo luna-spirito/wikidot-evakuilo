@@ -313,7 +313,7 @@ async fn revision_fetch(
         Err(e) => return Err(e),
     };
 
-    let links = parsers::extract_file_links(&source);
+    let links = parsers::extract_file_links(&api.site, &source);
     let n_links = links.len();
     let fetched_at = db::now();
     let effects: Effects = Box::new(move |tx| {
@@ -359,7 +359,25 @@ async fn file_fetch(
         _ => {}
     }
 
-    let (bytes, header_type) = match api.fetch_attachment(&p.path).await {
+    // Row keys are canonical absolute URLs. Hosts on THIS site (either
+    // spelling — `{site}.wikidot.com`, `{site}.wdfiles.com`) fetch through
+    // the main domain with the site session, exactly like the old
+    // site-relative rows; every other host (sandboxes, sister wikis, CDN
+    // theme assets) is cross-site, no cookies. A site-relative payload
+    // (pre-v6 straggler) still routes through the main domain.
+    let absolute = p.path.starts_with("http://") || p.path.starts_with("https://");
+    let own_host = |path: &str| match parsers::url_host(path) {
+        Some(h) => {
+            h == format!("{}.wikidot.com", api.site) || h == format!("{}.wdfiles.com", api.site)
+        }
+        None => !absolute,
+    };
+    let fetched = if own_host(&p.path) {
+        api.fetch_attachment(&p.path).await
+    } else {
+        api.fetch_public(&p.path).await
+    };
+    let (bytes, header_type) = match fetched {
         Ok(b) => b,
         Err(FetchError::NotFound) => {
             // Deleted upstream (v1 `failed_files`): permanent, recorded.
@@ -378,11 +396,48 @@ async fn file_fetch(
         Err(e) => return Err(e),
     };
 
+    // Wikidot answers a nonexistent file with HTTP 200 + an HTML error page
+    // (never localized, never a real attachment media type): that must not
+    // be archived as the asset. "The file does not exist" is the terminal
+    // soft-404; any other HTML body (a "408 Request Time-out" page served
+    // as 200, …) is transient — surface as an error so the queue retries.
+    if header_type.as_deref() == Some("text/html") {
+        let page = String::from_utf8_lossy(&bytes);
+        if page.contains("The file does not exist") {
+            let path = p.path.clone();
+            let effects: Effects = Box::new(move |tx| {
+                tx.execute(
+                    "INSERT INTO files(path, status, first_seen) VALUES(?1, 'missing', ?2)
+                     ON CONFLICT(path) DO UPDATE SET status='missing'",
+                    params![path, db::now()],
+                )?;
+                Ok(())
+            });
+            tracing::info!(site = %api.site, path = %p.path, "attachment missing (soft 404)");
+            return Ok(complete(None, effects));
+        }
+        return Err(FetchError::Http(format!(
+            "html error page for {}: {}",
+            p.path,
+            page.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
+        )));
+    }
+
+    // wdfiles intermittently answers 200 with an EMPTY body (observed
+    // live, alongside the HTML error pages). No attachment is zero bytes,
+    // so that must not freeze an empty blob as the evacuated truth —
+    // surface as a transient error and let the queue retry.
+    if bytes.is_empty() {
+        return Err(FetchError::Http(format!("empty body for {}", p.path)));
+    }
+
     let sha = blobs::write_blob(out_dir, &bytes)
         .map_err(|e| FetchError::Http(format!("blob write: {e}")))?;
     // Server's word first; sniff when it said nothing.
     let content_type = header_type.or_else(|| blobs::sniff_content_type(&bytes, &p.path));
-    let url = format!("http://{}.wikidot.com/{}", api.site, p.path);
+    // The row key is the canonical URL the fetch went to (redirects to
+    // wdfiles are the server's business, not provenance worth recording).
+    let url = p.path.clone();
     let path = p.path.clone();
     let size = bytes.len() as i64;
     let effects: Effects = Box::new(move |tx| {
