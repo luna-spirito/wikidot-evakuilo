@@ -17,6 +17,17 @@
 //! is persisted to the site's own database (`meta` key `cookies`) whenever
 //! it changes and reloaded on daemon start — a restart keeps its session
 //! instead of burning a bootstrap GET per site.
+//!
+//! Wikidot sites have per-site canonical schemes: most canonicalize
+//! `https://{site}.wikidot.com` back to `http://`, but some (backrooms-wiki
+//! and friends) do the reverse — and their port-80 listener answers POSTs
+//! unreliably. Requests therefore go to the site's canonical scheme from
+//! the start: every site response records its final post-redirect URL's
+//! scheme into a per-site RAM cache, `base()` URLs build from it, and the
+//! first AJAX call of a cold process bootstrap-GETs the site root to learn
+//! it. POSTs additionally follow redirects MANUALLY (reqwest rewrites
+//! 301/302/303 to bodyless GETs): the form is re-posted onto the Location
+//! target, so a scheme-canonicalization hop keeps AJAX semantics.
 
 use std::{
     cmp::{Ordering, Reverse},
@@ -183,10 +194,21 @@ impl CookieJar {
 
 // ── Client ──
 
+/// Max hops a manually-followed POST redirect chain may take.
+const POST_REDIRECT_HOPS: usize = 5;
+
 pub struct Wikidot {
+    /// Auto-following client for GETs (and third-party assets).
     http: reqwest::Client,
+    /// No-redirect client for POSTs: the AJAX form is re-posted by hand so
+    /// a redirect hop cannot strip the method and body.
+    post_http: reqwest::Client,
     limiter: Limiter,
     jars: Mutex<HashMap<String, CookieJar>>,
+    /// Per-site canonical scheme (`http`/`https`), learned from the final
+    /// post-redirect URL of any site response. RAM-only: a fresh process
+    /// re-learns it with the first bootstrap GET.
+    schemes: Mutex<HashMap<String, String>>,
     /// Per-site session store: the site's own database. Present only for
     /// daemon-run sites; one-shot commands run sessionless.
     stores: Mutex<HashMap<String, Db>>,
@@ -198,14 +220,19 @@ pub struct Wikidot {
 
 impl Wikidot {
     pub fn new(rate_limit_ms: u64, timeout_s: u64) -> anyhow::Result<Wikidot> {
-        let http = reqwest::Client::builder()
-            .user_agent("WikidotEvakuilo/4.0")
-            .timeout(Duration::from_secs(timeout_s))
-            .build()?;
+        let build = |policy: reqwest::redirect::Policy| {
+            reqwest::Client::builder()
+                .user_agent("WikidotEvakuilo/4.0")
+                .timeout(Duration::from_secs(timeout_s))
+                .redirect(policy)
+                .build()
+        };
         Ok(Wikidot {
-            http,
+            http: build(reqwest::redirect::Policy::default())?,
+            post_http: build(reqwest::redirect::Policy::none())?,
             limiter: Limiter::new(rate_limit_ms),
             jars: Mutex::new(HashMap::new()),
+            schemes: Mutex::new(HashMap::new()),
             stores: Mutex::new(HashMap::new()),
             token_gates: Mutex::new(HashMap::new()),
             timeout: Duration::from_secs(timeout_s),
@@ -255,13 +282,15 @@ impl Wikidot {
         }
         let resp = req.send().await.map_err(map_reqwest_err)?;
         self.absorb_cookies(site, &resp);
+        self.remember_scheme(site, &resp);
         check_status(resp).await
     }
 
     /// Rate-limited GET of a public third-party resource (theme CSS on a
-    /// CDN, fonts, …): NO cookie header out, NO cookie absorb in — the
-    /// site's Wikidot session must never leak to (or be polluted by) other
-    /// hosts. Shares the global limiter: one politeness budget for all hosts.
+    /// CDN, fonts, …): NO cookie header out, NO cookie absorb in, NO scheme
+    /// learning — the site's Wikidot session must never leak to (or be
+    /// polluted by) other hosts. Shares the global limiter: one politeness
+    /// budget for all hosts.
     pub async fn get_public(&self, url: &str, prio: i64) -> Result<reqwest::Response, FetchError> {
         self.limiter.acquire(prio).await;
         let req = self.http.get(url).timeout(self.timeout);
@@ -269,7 +298,12 @@ impl Wikidot {
         check_status(resp).await
     }
 
-    /// Rate-limited POST of a urlencoded form.
+    /// Rate-limited POST of a urlencoded form. Redirects are followed
+    /// manually: reqwest rewrites 301/302/303 to bodyless GETs, which
+    /// turns an AJAX call into a junk response, so each `Location` hop
+    /// re-posts the same form (a fresh limiter ticket per hop — one per
+    /// actual request). Session cookies ride on every hop; each response
+    /// feeds the scheme cache. Returns the first non-redirect response.
     pub async fn post_form(
         &self,
         site: &str,
@@ -277,14 +311,68 @@ impl Wikidot {
         params: &[(&str, String)],
         prio: i64,
     ) -> Result<reqwest::Response, FetchError> {
-        self.limiter.acquire(prio).await;
-        let mut req = self.http.post(url).timeout(self.timeout).form(params);
-        if let Some(cookie) = self.cookie_header(site) {
-            req = req.header("cookie", cookie);
+        let mut current = reqwest::Url::parse(url).map_err(|e| FetchError::Http(e.to_string()))?;
+        for _ in 0..POST_REDIRECT_HOPS {
+            self.limiter.acquire(prio).await;
+            let mut req = self
+                .post_http
+                .post(current.clone())
+                .timeout(self.timeout)
+                .form(params);
+            if let Some(cookie) = self.cookie_header(site) {
+                req = req.header("cookie", cookie);
+            }
+            let resp = req.send().await.map_err(map_reqwest_err)?;
+            self.absorb_cookies(site, &resp);
+            self.remember_scheme(site, &resp);
+            if !resp.status().is_redirection() {
+                return check_status(resp).await;
+            }
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .ok_or_else(|| {
+                    FetchError::Http(format!("redirect without Location: {}", resp.status()))
+                })?;
+            current = current.join(loc).map_err(|e| FetchError::Http(e.to_string()))?;
         }
-        let resp = req.send().await.map_err(map_reqwest_err)?;
-        self.absorb_cookies(site, &resp);
-        check_status(resp).await
+        Err(FetchError::Http(format!(
+            "POST redirect chain exceeded {POST_REDIRECT_HOPS} hops at {current}"
+        )))
+    }
+
+    /// The site's canonical scheme: the learned one, or `http` until any
+    /// response of the process proved otherwise.
+    pub fn scheme(&self, site: &str) -> String {
+        self.schemes
+            .lock()
+            .get(site)
+            .cloned()
+            .unwrap_or_else(|| "http".into())
+    }
+
+    /// Whether the canonical scheme has been observed this process.
+    pub fn scheme_known(&self, site: &str) -> bool {
+        self.schemes.lock().contains_key(site)
+    }
+
+    /// Learn the site's canonical scheme from a response's final URL (the
+    /// bootstrap GET lands on the redirect target, e.g. http→https). Only
+    /// responses served by the site's own host count — third-party hosts
+    /// (wdfiles, CDNs, sandboxes) must not poison the cache.
+    fn remember_scheme(&self, site: &str, resp: &reqwest::Response) {
+        let own = format!("{site}.wikidot.com");
+        if resp.url().host_str() != Some(own.as_str()) {
+            return;
+        }
+        let scheme = resp.url().scheme().to_string();
+        let mut schemes = self.schemes.lock();
+        if schemes.get(site).map(String::as_str) != Some(scheme.as_str()) {
+            tracing::info!(site, %scheme, "canonical scheme learned");
+            schemes.insert(site.to_string(), scheme);
+        }
     }
 
     pub fn cookie_header(&self, site: &str) -> Option<String> {
@@ -463,5 +551,160 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(80));
         lim.acquire(0).await;
         assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    // ── Manual POST redirect following + scheme cache ──
+
+    /// A raw-TCP mock origin serving one response per connection. Requests
+    /// are read to completion (headers + Content-Length body) and recorded
+    /// for assertions.
+    struct MockOrigin {
+        addr: std::net::SocketAddr,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockOrigin {
+        /// `build` receives the bound address so redirect targets can lead
+        /// back to the mock itself.
+        fn serve(build: impl FnOnce(std::net::SocketAddr) -> Vec<String>) -> MockOrigin {
+            let listener = Arc::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = listener.local_addr().unwrap();
+            let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let thread_log = Arc::clone(&log);
+            for response in build(addr) {
+                let listener = Arc::clone(&listener);
+                let thread_log = Arc::clone(&thread_log);
+                std::thread::spawn(move || {
+                    let Ok((mut sock, _)) = listener.accept() else { return };
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    // Read until the head is complete, then honor
+                    // Content-Length if one was sent.
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&buf[..n]);
+                                let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n");
+                                if let Some(pos) = head_end {
+                                    let len = String::from_utf8_lossy(&raw[..pos])
+                                        .lines()
+                                        .find_map(|l| {
+                                            let v = l.strip_prefix("Content-Length:")?
+                                                .trim()
+                                                .parse::<usize>()
+                                                .ok()
+                                            ;
+                                            v
+                                        })
+                                        .unwrap_or(0);
+                                    if raw.len() >= pos + 4 + len {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    thread_log
+                        .lock()
+                        .push(String::from_utf8_lossy(&raw).into_owned());
+                    let _ = sock.write_all(response.as_bytes());
+                });
+            }
+            MockOrigin { addr, log }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.log.lock().clone()
+        }
+    }
+
+    use std::io::{Read, Write};
+
+    fn redirect_response(to: &str) -> String {
+        format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn ok_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn post_form_reposts_the_form_across_a_redirect_hop() {
+        let host = "127.0.0.1";
+        let mock = MockOrigin::serve(|addr| {
+            vec![
+                redirect_response(&format!("http://{addr}/landing")),
+                ok_response("done"),
+            ]
+        });
+        let wik = Wikidot::new(1, 5).unwrap();
+
+        let resp = wik
+            .post_form(
+                host,
+                &format!("http://{}/origin", mock.addr),
+                &[("moduleName", "test/Module".into())],
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.text().await.unwrap(), "done");
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2);
+        // The form reaches BOTH hops intact — reqwest's auto-follow would
+        // have downgraded the 301 to a bodyless GET.
+        for req in &reqs {
+            assert!(req.starts_with("POST /"));
+            assert!(req.contains("moduleName=test%2FModule"));
+        }
+        assert!(reqs[0].starts_with("POST /origin"));
+        assert!(reqs[1].starts_with("POST /landing"));
+    }
+
+    #[tokio::test]
+    async fn post_form_bails_out_on_a_redirect_loop() {
+        let host = "127.0.0.1";
+        let responses = vec![redirect_response("/next"); POST_REDIRECT_HOPS + 1];
+        let mock = MockOrigin::serve(|_| responses);
+        let wik = Wikidot::new(1, 5).unwrap();
+
+        let err = wik
+            .post_form(
+                host,
+                &format!("http://{}/origin", mock.addr),
+                &[("a", "b".into())],
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("redirect chain exceeded"),
+            "unexpected error: {err}"
+        );
+        // Every hop was a real request, none past the cap.
+        assert_eq!(mock.requests().len(), POST_REDIRECT_HOPS);
+    }
+
+    #[tokio::test]
+    async fn scheme_cache_defaults_to_http_and_learns() {
+        let wik = Wikidot::new(1, 5).unwrap();
+        assert_eq!(wik.scheme("demo"), "http");
+        assert!(!wik.scheme_known("demo"));
+        // In-module: simulate a learned response.
+        wik.schemes
+            .lock()
+            .insert("demo".into(), "https".into());
+        assert_eq!(wik.scheme("demo"), "https");
+        assert!(wik.scheme_known("demo"));
+        // Other sites are unaffected.
+        assert_eq!(wik.scheme("other"), "http");
     }
 }

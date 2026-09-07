@@ -38,7 +38,7 @@ impl<'a> SiteApi<'a> {
     }
 
     fn base(&self) -> String {
-        format!("http://{}.wikidot.com", self.site)
+        format!("{}://{}.wikidot.com", self.wik.scheme(&self.site), self.site)
     }
 
     // ── Generic retry wrapper (v1 `retryable`) ──
@@ -69,23 +69,28 @@ impl<'a> SiteApi<'a> {
 
     // ── Session bootstrap ──
 
-    /// Lazily fetch a CSRF token (v1 `ensure_token`): the first AJAX call
-    /// of a cold session pulls one via a plain site GET. The per-site gate
-    /// keeps concurrent cold workers from racing — one GET refreshes, the
-    /// rest re-check under the lock and find the cookie already set.
-    async fn ensure_token(&self) -> FetchResult<()> {
-        if self.wik.token7(&self.site).is_some() {
+    /// Lazily bootstrap a cold session (v1 `ensure_token`): the first AJAX
+    /// call of the process needs both the CSRF token and the site's
+    /// canonical scheme (AJAX POSTs must not go to a non-canonical scheme —
+    /// some sites' port-80 POST path is dead, e.g. backrooms-wiki). The
+    /// bootstrap GET of the site root provides both: cookies carry the
+    /// token7, the final post-redirect URL carries the scheme. The per-site
+    /// gate keeps concurrent cold workers from racing — one GET refreshes,
+    /// the rest re-check under the lock and find both already known.
+    async fn ensure_session(&self) -> FetchResult<()> {
+        if self.wik.token7(&self.site).is_some() && self.wik.scheme_known(&self.site) {
             return Ok(());
         }
         let gate = self.wik.token_gate(&self.site);
         let _guard = gate.lock().await;
-        if self.wik.token7(&self.site).is_some() {
+        if self.wik.token7(&self.site).is_some() && self.wik.scheme_known(&self.site) {
             return Ok(());
         }
-        self.retryable("token refresh", || async {
+        self.retryable("session bootstrap", || async {
             let url = format!("{}/", self.base());
             let _resp = self.wik.get(&self.site, &url, self.prio).await?;
-            // Absorbing cookies happened in the client; confirm the token.
+            // Cookies were absorbed (and the scheme learned) in the client;
+            // confirm the token.
             if self.wik.token7(&self.site).is_some() {
                 Ok(())
             } else {
@@ -100,7 +105,7 @@ impl<'a> SiteApi<'a> {
     // ── AJAX plumbing ──
 
     async fn ajax(&self, params: &[(&str, String)]) -> FetchResult<String> {
-        self.ensure_token().await?;
+        self.ensure_session().await?;
         let token = self
             .wik
             .token7(&self.site)
@@ -243,12 +248,12 @@ impl<'a> SiteApi<'a> {
     }
 
     /// Fetch an attachment: (bytes, media type). `path_or_url` is the
-    /// canonical absolute row URL (`http://{site}.wikidot.com/…`, which
+    /// canonical absolute row URL (`{scheme}://{site}.wikidot.com/…`, which
     /// 302s to wdfiles server-side); a site-relative path still works
-    /// (pre-v6 stragglers) and lifts onto the main domain. Session cookies
-    /// ride along — this is the site's own namespace. The media type is
-    /// the server's Content-Type sans parameters, or None when it sent
-    /// nothing usable — callers fall back to sniffing.
+    /// (pre-v6 stragglers) and lifts onto the canonical scheme. Session
+    /// cookies ride along — this is the site's own namespace. The media
+    /// type is the server's Content-Type sans parameters, or None when it
+    /// sent nothing usable — callers fall back to sniffing.
     pub async fn fetch_attachment(&self, path_or_url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
         let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
             path_or_url.to_string()
