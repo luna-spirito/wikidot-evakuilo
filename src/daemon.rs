@@ -39,6 +39,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         if seeded > 0 {
             tracing::info!(site, seeded, "seeded periodic jobs");
         }
+        // Keep the session across restarts: load the persisted cookies
+        // (CSRF token incl.) now, persist changes as they arrive.
+        wik.attach_store(&site, db.clone());
         locks.push(lock);
         let handle = tokio::spawn(site_worker(cfg.clone(), Arc::clone(&wik), db, site));
         handles.push(handle);

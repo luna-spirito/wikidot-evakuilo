@@ -21,13 +21,19 @@ const AJAX_RETRIES: u32 = 5;
 pub struct SiteApi<'a> {
     pub wik: &'a Wikidot,
     pub site: String,
+    /// The executing job's claim priority (`jobs::prio`). Rides on every
+    /// rate-limiter ticket request, so the shared limiter serves this job's
+    /// HTTP ahead of lower-priority backlog that queued earlier from other
+    /// workers and sites.
+    pub prio: i64,
 }
 
 impl<'a> SiteApi<'a> {
-    pub fn new(wik: &'a Wikidot, site: &str) -> SiteApi<'a> {
+    pub fn new(wik: &'a Wikidot, site: &str, prio: i64) -> SiteApi<'a> {
         SiteApi {
             wik,
             site: site.to_string(),
+            prio,
         }
     }
 
@@ -78,7 +84,7 @@ impl<'a> SiteApi<'a> {
         }
         self.retryable("token refresh", || async {
             let url = format!("{}/", self.base());
-            let _resp = self.wik.get(&self.site, &url).await?;
+            let _resp = self.wik.get(&self.site, &url, self.prio).await?;
             // Absorbing cookies happened in the client; confirm the token.
             if self.wik.token7(&self.site).is_some() {
                 Ok(())
@@ -103,12 +109,28 @@ impl<'a> SiteApi<'a> {
         full.push(("callbackIndex", "0".into()));
         full.push(("wikidot_token7", token));
         let url = format!("{}/ajax-module-connector.php", self.base());
-        let resp = self.wik.post_form(&self.site, &url, &full).await?;
+        let resp = self.wik.post_form(&self.site, &url, &full, self.prio).await?;
         let body = resp
             .text()
             .await
             .map_err(|e| FetchError::Http(e.to_string()))?;
-        parse_ajax_body(&body)
+        match parse_ajax_body(&body) {
+            Ok(body) => Ok(body),
+            Err(AjaxRejection::NoPermission) => Err(FetchError::Forbidden),
+            Err(AjaxRejection::WrongToken) => {
+                // The CSRF token went stale server-side (possible now that
+                // sessions persist across restarts). Drop it — any session
+                // cookie alongside it stays — and surface a retryable
+                // error: the next attempt re-bootstraps via `ensure_token`.
+                self.wik.forget_token(&self.site);
+                Err(FetchError::Http(
+                    "wikidot_token7 rejected as stale (wrong_token7)".into(),
+                ))
+            }
+            Err(AjaxRejection::Other(status)) => Err(FetchError::Parse(format!(
+                "AJAX status '{status}' (expected 'ok')"
+            ))),
+        }
     }
 
     // ── Endpoints ──
@@ -145,7 +167,7 @@ impl<'a> SiteApi<'a> {
         };
         let html = self
             .retryable(&format!("GET {slug_str}"), || async {
-                let resp = self.wik.get(&self.site, &url).await?;
+                let resp = self.wik.get(&self.site, &url, self.prio).await?;
                 resp.text()
                     .await
                     .map(|body| body.replace('\u{feff}', ""))
@@ -234,7 +256,7 @@ impl<'a> SiteApi<'a> {
             format!("{}/{path_or_url}", self.base())
         };
         self.retryable(&format!("attachment {path_or_url}"), || async {
-            let resp = self.wik.get(&self.site, &url).await?;
+            let resp = self.wik.get(&self.site, &url, self.prio).await?;
             let content_type = media_type(resp.headers());
             let bytes = resp
                 .bytes()
@@ -252,7 +274,7 @@ impl<'a> SiteApi<'a> {
     /// Returns (bytes, media type) like `fetch_attachment`.
     pub async fn fetch_public(&self, url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
         self.retryable(&format!("public asset {url}"), || async {
-            let resp = self.wik.get_public(url).await?;
+            let resp = self.wik.get_public(url, self.prio).await?;
             let content_type = media_type(resp.headers());
             let bytes = resp
                 .bytes()
@@ -273,28 +295,59 @@ fn media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
     (!mime.is_empty()).then(|| mime.to_ascii_lowercase())
 }
 
-/// v1 `parse_ajax_body`: `{status, body?}`; `no_permission` → Forbidden,
-/// other non-`ok` statuses are parse errors.
-fn parse_ajax_body(json: &str) -> FetchResult<String> {
+/// v1 `parse_ajax_body`: `{status, body?}`. The rejections callers act on
+/// are distinct: `no_permission` is genuinely private content (never a
+/// token problem), `wrong_token7` (observed verbatim from the live
+/// connector on a bogus token) means the CSRF token went stale, and
+/// anything else is a parse failure.
+#[derive(Debug, PartialEq, Eq)]
+enum AjaxRejection {
+    NoPermission,
+    WrongToken,
+    Other(String),
+}
+
+fn parse_ajax_body(json: &str) -> Result<String, AjaxRejection> {
     #[derive(Deserialize)]
     struct Ajax {
         status: String,
         body: Option<String>,
     }
     let parsed: Ajax = serde_json::from_str(json)
-        .map_err(|_| FetchError::Parse("failed to parse AJAX JSON".into()))?;
+        .map_err(|_| AjaxRejection::Other("failed to parse AJAX JSON".into()))?;
     match parsed.status.as_str() {
         "ok" => Ok(parsed.body.unwrap_or_default()),
-        "no_permission" => Err(FetchError::Forbidden),
-        other => Err(FetchError::Parse(format!(
-            "AJAX status '{other}' (expected 'ok')"
-        ))),
+        "no_permission" => Err(AjaxRejection::NoPermission),
+        "wrong_token7" => Err(AjaxRejection::WrongToken),
+        other => Err(AjaxRejection::Other(other.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ajax_body_distinguishes_rejections() {
+        assert_eq!(parse_ajax_body(r#"{"status":"ok","body":"<b>x</b>"}"#).unwrap(), "<b>x</b>");
+        assert_eq!(parse_ajax_body(r#"{"status":"ok"}"#).unwrap(), "");
+        assert_eq!(
+            parse_ajax_body(r#"{"status":"no_permission"}"#),
+            Err(AjaxRejection::NoPermission)
+        );
+        assert_eq!(
+            parse_ajax_body(r#"{"status":"wrong_token7","message":"no","CURRENT_TIMESTAMP":1}"#),
+            Err(AjaxRejection::WrongToken)
+        );
+        assert!(matches!(
+            parse_ajax_body(r#"{"status":"internal_error"}"#),
+            Err(AjaxRejection::Other(_))
+        ));
+        assert!(matches!(
+            parse_ajax_body("<html>gateway error</html>"),
+            Err(AjaxRejection::Other(_))
+        ));
+    }
 
     fn ct(value: &str) -> Option<String> {
         let mut headers = reqwest::header::HeaderMap::new();

@@ -61,7 +61,7 @@ fn fail_err(e: &FetchError) -> Outcome {
 }
 
 pub async fn run_job(db: &Db, cfg: &Config, wik: &Wikidot, site: &str, job: &db::Job) -> Outcome {
-    let api = SiteApi::new(wik, site);
+    let api = SiteApi::new(wik, site, job.priority);
     let out_dir = cfg.site_out(site);
     let result = match job.kind.as_str() {
         jobs::kind::DISCOVER => discover(db, cfg, &api).await,

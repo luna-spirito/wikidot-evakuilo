@@ -42,7 +42,11 @@
 //! ## Priorities
 //!
 //! Priorities are per-row (set at enqueue time, see `prio`) and decide
-//! claim order when the queue backs up. The order is evacuation triage:
+//! claim order when the queue backs up. They ride on execution too: every
+//! HTTP request of a job requests its rate-limiter ticket at the job's
+//! priority (`http::Limiter`), so a fresh site's urgent jobs take tickets
+//! ahead of bulk requests that backed-up sites queued long before — FIFO
+//! within one priority. The order is evacuation triage:
 //! the shell first — one cheap homepage GET that also seeds the theme
 //! crawl, without which the exported site is barely usable — then the
 //! freshness ladder (a fresh recent-change never waits behind the history

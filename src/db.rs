@@ -770,6 +770,17 @@ impl Db {
             .optional()?)
     }
 
+    /// Upsert a `meta` row.
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.0.lock();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// Highest revision number known for a page, -1 if none.
     pub fn max_rev(&self, page_id: i64) -> Result<i64> {
         let conn = self.0.lock();
@@ -1304,6 +1315,19 @@ mod tests {
         };
         assert_eq!(run_at("shell.sync"), 0);
         assert_eq!(run_at("out.update"), far);
+    }
+
+    #[test]
+    fn meta_upsert_and_delete_round_trip() {
+        let (_d, db, _l) = site("meta");
+        assert_eq!(db.meta_get("cookies").unwrap(), None);
+        db.meta_set("cookies", r#"{"a":"b"}"#).unwrap();
+        assert_eq!(
+            db.meta_get("cookies").unwrap().as_deref(),
+            Some(r#"{"a":"b"}"#)
+        );
+        db.meta_set("cookies", "{}").unwrap();
+        assert_eq!(db.meta_get("cookies").unwrap().as_deref(), Some("{}"));
     }
 
     #[test]
