@@ -552,14 +552,46 @@ fn own_file_url(site: &str, tail: &str) -> String {
 fn take_until_stop(s: &str) -> String {
     // `|` stops too: it separates wikitext arguments
     // (`…name=x.png|align=center`), never forms part of a URL path.
+    // `[` likewise: an unencoded bracket is illegal in a URL path (it must
+    // be %5B), and wikitext brings them in spades — `…x.png[!----]` comment
+    // syntax glued to a bare reference once leaked `[!----` into a row key.
     s.chars()
         .take_while(|c| {
             !matches!(
                 c,
-                '"' | ' ' | '\n' | ')' | '>' | '\'' | ']' | '\\' | '|'
+                '"' | ' ' | '\n' | ')' | '>' | '\'' | ']' | '\\' | '|' | '['
             )
         })
         .collect()
+}
+
+/// Classify a `text/html` body served for a file fetch. Wikidot's error
+/// pages are title-stamped and language-fixed: `The file does not exist`
+/// (soft-404), `The site does not exist` (deleted site — every path on the
+/// host answers it), `Not authorized` (private site we hold no credentials
+/// for). Anything else is a REAL attachment — `.php`/`.html` files are
+/// served as `text/html` with full content, and the v6 assumption that no
+/// attachment ever arrives as HTML was simply wrong.
+pub fn html_error_page_kind(html: &str) -> Option<&'static str> {
+    let lower = html.to_ascii_lowercase();
+    let title = lower
+        .split_once("<title")
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .and_then(|(_, rest)| rest.split_once("</title>"))
+        .map(|(text, _)| text.trim())
+        .unwrap_or("");
+    match title {
+        "the file does not exist" => return Some("file"),
+        "the site does not exist" => return Some("site"),
+        "not authorized" => return Some("auth"),
+        _ => {}
+    }
+    // Belt and braces for a stripped/garbled title: the file soft-404 body
+    // also carries the sentence as plain text.
+    if lower.contains("the file does not exist") {
+        return Some("file");
+    }
+    None
 }
 
 // ── Tests ──
@@ -711,6 +743,51 @@ WIKIREQUEST.info.pageId = 1457213925;
         assert_eq!(
             extract_page_files("rpcauthority", listing),
             vec!["http://rpcauthority.wikidot.com/local--files/rpc-001/cover.jpg".to_string()]
+        );
+    }
+
+    /// A bare reference glued to wikitext bracket syntax must not leak the
+    /// brackets into the path (observed live: `…/Мяу.mp3[!----`).
+    #[test]
+    fn file_links_stop_at_bracket() {
+        let src = "http://sons-of-athena.example/local--files/draft:fox/cat.mp3[!----]] tail";
+        assert_eq!(
+            extract_file_links("mywiki", src),
+            vec!["http://sons-of-athena.example/local--files/draft:fox/cat.mp3".to_string()]
+        );
+        // `[[image …]]` closing brackets were already handled by `]`; the
+        // new `[` stop must not break them.
+        let src = "[[image local--files/p/i.png]]";
+        assert_eq!(
+            extract_file_links("mywiki", src),
+            vec!["http://mywiki.wikidot.com/local--files/p/i.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn html_error_pages_classify_by_title() {
+        assert_eq!(
+            html_error_page_kind("<html><head><title>The file does not exist</title></head><body>The file does not exist.</body></html>"),
+            Some("file")
+        );
+        assert_eq!(
+            html_error_page_kind(r#"<html><head><title>The site does not exist</title></head><body></body></html>"#),
+            Some("site")
+        );
+        assert_eq!(
+            html_error_page_kind("<html><head><title>Not authorized</title></head></html>"),
+            Some("auth")
+        );
+        // Title stripped but the soft-404 sentence survives in the body.
+        assert_eq!(
+            html_error_page_kind("<html><body>The file does not exist.</body></html>"),
+            Some("file")
+        );
+        // A real HTML attachment (39 KB PHP file observed live): arbitrary
+        // title, real content — must NOT be classified as an error page.
+        assert_eq!(
+            html_error_page_kind(r#"<html oncontextmenu="return false"><head><title>RSC Institution</title></head><body>…real content…</body></html>"#),
+            None
         );
     }
 

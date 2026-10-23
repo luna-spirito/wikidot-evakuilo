@@ -222,6 +222,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration::Sql(RETUNE_PRIORITIES_V4),
     Migration::Sql(REARM_SHELL_SYNC_V5),
     Migration::Repair(repair_files_v6),
+    Migration::Repair(repair_files_v7),
 ];
 
 /// v6: file references mined from wikitext were defective twice over —
@@ -233,10 +234,12 @@ const MIGRATIONS: &[Migration] = &[
 ///
 /// * garbage paths (`…|caption=`, site-relative refs with no page/name
 ///   split) are deleted, along with their pending fetch jobs;
-/// * rows "saved" as `text/html` — Wikidot never serves attachments as
-///   HTML, every one is an error page — reset to `pending` with the blob
-///   fields cleared, so the fixed fetcher records a truthful `missing`
-///   (or re-saves a genuinely re-fetchable file);
+/// * rows "saved" as `text/html` — believed at the time that Wikidot never
+///   serves attachments as HTML — reset to `pending` with the blob fields
+///   cleared. (The belief was wrong: `.php`/`.html` attachments ARE served
+///   as text/html; v7-era `file_fetch` classifies error pages by title and
+///   archives real HTML attachments, so these rows re-fetch into their
+///   truthful state.)
 /// * link extraction re-runs over every stored revision with the fixed
 ///   parser, seeding the correct rows as pending — no `revision.fetch`
 ///   backfill is needed, which is lucky because those fast-path skip
@@ -423,6 +426,97 @@ fn repair_files_v6(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
         lifted,
         merged,
         "v6 file-reference repair"
+    );
+    Ok(())
+}
+
+/// v7: bracket-junk row keys. `take_until_stop` did not stop at `[`, so
+/// wikitext bracket syntax glued to a bare reference leaked into row keys
+/// (observed live: `…/cat.mp3[!----`), and such a URL can never fetch —
+/// every attempt fails at DNS, the job retries and the hourly backfill
+/// resurrects it forever. Delete every row whose key contains an unencoded
+/// `[` (illegal in a canonical key by construction, junk or attack), along
+/// with its jobs in ANY state (a dead tombstone on a junk payload would
+/// re-arm against a deleted row); then re-run link extraction over all
+/// stored revisions so the references those keys were meant to name get
+/// seeded cleanly and armed. Idempotent by construction.
+fn repair_files_v7(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>) -> Result<()> {
+    use std::collections::{BTreeSet, HashSet};
+
+    let junk_paths: BTreeSet<String> = {
+        let mut stmt = tx.prepare("SELECT path, sha256 FROM files WHERE path LIKE '%[%'")?;
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Junk rows never fetched successfully (the URL is unparseable
+        // garbage), but a saved one would lose its blob — GC it like v6.
+        orphans.extend(rows.iter().filter_map(|(_, sha)| sha.clone()));
+        rows.into_iter().map(|(path, _)| path).collect()
+    };
+
+    let mut junk_rows = 0usize;
+    let mut junk_jobs = 0usize;
+    if !junk_paths.is_empty() {
+        let ph_paths = vec!["?"; junk_paths.len()].join(",");
+        junk_rows = tx.execute(
+            &format!("DELETE FROM files WHERE path IN ({ph_paths})"),
+            params_from_iter(junk_paths.iter()),
+        )?;
+        let payloads: Vec<String> = junk_paths
+            .iter()
+            .map(|p| serde_json::json!({ "path": p }).to_string())
+            .collect();
+        junk_jobs = tx.execute(
+            &format!(
+                "DELETE FROM jobs
+                  WHERE kind='file.fetch' AND payload IN ({})",
+                vec!["?"; payloads.len()].join(",")
+            ),
+            params_from_iter(payloads.iter()),
+        )?;
+    }
+
+    // Re-seed with the fixed extractor (same shape as v6's seeding pass).
+    let mut refs: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = tx.prepare("SELECT content FROM revisions WHERE content IS NOT NULL")?;
+        let rows: Vec<String> =
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for content in rows {
+            for path in crate::parsers::extract_file_links(&ctx.site, &content) {
+                refs.insert(path);
+            }
+        }
+    }
+    let mut seeded = 0usize;
+    for path in refs.into_iter().collect::<BTreeSet<_>>() {
+        seeded += tx.execute(
+            "INSERT OR IGNORE INTO files(path, first_seen) VALUES(?1, ?2)",
+            params![path, now()],
+        )?;
+    }
+
+    let mut stmt = tx.prepare("SELECT path FROM files WHERE status='pending'")?;
+    let pending: Vec<String> =
+        stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let jobs: Vec<NewJob> = pending
+        .iter()
+        .map(|path| {
+            let mut j = crate::jobs::file_fetch(path);
+            j.resurrect = true;
+            j
+        })
+        .collect();
+    enqueue_on(tx, &jobs)?;
+
+    tracing::info!(
+        site = %ctx.site,
+        junk_paths = junk_paths.len(),
+        junk_rows,
+        junk_jobs,
+        reseeded = seeded,
+        "v7 bracket-junk file repair"
     );
     Ok(())
 }
@@ -1734,5 +1828,97 @@ mod tests {
         // Junk blob GC'd now that nothing references its sha; good one kept.
         assert!(!junk_blob.exists());
         assert!(good_blob.exists());
+    }
+
+    /// v7 must drop bracket-junk row keys (with their jobs, any state) and
+    /// re-seed the references those keys mangled, so the clean paths get
+    /// armed instead of retrying an unfetchable URL forever.
+    #[test]
+    fn v7_repair_drops_bracket_junk_and_reseeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db_path = repo.join("meta").join("demo").join("site.db");
+        let (db, _l) = Db::open_locked(&db_path).unwrap();
+        let ctx = RepairCtx {
+            site: "demo".into(),
+            out_dir: repo.join("out").join("demo"),
+        };
+
+        let junk = "http://sons-of-athena.example/local--files/draft:fox/cat.mp3[!----";
+        let junk_pending = serde_json::json!({ "path": junk }).to_string();
+        let junk_dead = serde_json::json!({ "path": "http://x.test/a[1].png" }).to_string();
+        db.with_conn(|conn| {
+            // Roll the schema back to v6 so the next migrate() replays v7.
+            conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO pages(page_id, slug, discovered_at) VALUES(1, 'p', ?1)",
+                params![now()],
+            )
+            .unwrap();
+            // The wikitext shape that produced the junk key (bracket
+            // comment glued to a bare reference) plus a clean reference.
+            conn.execute(
+                "INSERT INTO revisions(page_id, rev_no, rev_id, ts, author, content, fetched_at)
+                 VALUES(1, 0, 'r', 1, 1, ?1, 1)",
+                params![concat!(
+                    "glued http://sons-of-athena.example/local--files/draft:fox/cat.mp3[!----]] tail ",
+                    "clean http://demo.wikidot.com/local--files/p/a.png",
+                )],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files(path, status, first_seen) VALUES
+                 (?1, 'pending', ?2),
+                 ('http://x.test/a[1].png', 'missing', ?2)",
+                params![junk, now()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs(kind, payload, status, created_at) VALUES
+                 ('file.fetch', ?1, 'pending', ?3),
+                 ('file.fetch', ?2, 'dead', ?3)",
+                params![junk_pending, junk_dead, now()],
+            )
+            .unwrap();
+        });
+
+        db.migrate(&ctx).unwrap();
+
+        db.with_conn(|conn| {
+            // Junk keys are gone…
+            let left: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE path LIKE '%[%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0);
+            // …so are their jobs, tombstones included.
+            let stale: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM jobs WHERE kind='file.fetch' AND payload IN (?1, ?2)",
+                    params![junk_pending, junk_dead],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stale, 0);
+            // The bracket-stopped clean reference is seeded and armed.
+            let armed: (i64,) = conn
+                .query_row(
+                    "SELECT count(*) FROM jobs j
+                     JOIN files f ON j.payload = json_object('path', f.path)
+                      AND j.kind='file.fetch' AND j.status='pending' AND f.status='pending'
+                     WHERE f.path IN (?1, ?2)",
+                    params![
+                        "http://sons-of-athena.example/local--files/draft:fox/cat.mp3",
+                        "http://demo.wikidot.com/local--files/p/a.png"
+                    ],
+                    |r| Ok((r.get(0)?,)),
+                )
+                .unwrap();
+            assert_eq!(armed.0, 2);
+        });
     }
 }

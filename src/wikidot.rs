@@ -132,6 +132,7 @@ impl<'a> SiteApi<'a> {
                     "wikidot_token7 rejected as stale (wrong_token7)".into(),
                 ))
             }
+            Err(AjaxRejection::Gone(status)) => Err(FetchError::Gone(status)),
             Err(AjaxRejection::Other(status)) => Err(FetchError::Parse(format!(
                 "AJAX status '{status}' (expected 'ok')"
             ))),
@@ -301,16 +302,24 @@ fn media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 /// v1 `parse_ajax_body`: `{status, body?}`. The rejections callers act on
-/// are distinct: `no_permission` is genuinely private content (never a
-/// token problem), `wrong_token7` (observed verbatim from the live
-/// connector on a bogus token) means the CSRF token went stale, and
-/// anything else is a parse failure.
+/// are distinct: `no_permission` is genuinely private content (never a token
+/// problem), `wrong_token7` (observed verbatim from the live connector on a
+/// bogus token) means the CSRF token went stale, `revision_error` (observed
+/// verbatim: "Error accessing revisions: please contact Wikidot.com") is the
+/// server saying it cannot serve that revision at all — deterministic per
+/// revision, so retrying only hammers Wikidot — and anything else is a
+/// parse failure.
 #[derive(Debug, PartialEq, Eq)]
 enum AjaxRejection {
     NoPermission,
     WrongToken,
+    Gone(String),
     Other(String),
 }
+
+/// AJAX statuses that mean "this specific object can never be served" —
+/// terminal for the caller, unlike a generic parse failure.
+const GONE_STATUSES: &[&str] = &["revision_error"];
 
 fn parse_ajax_body(json: &str) -> Result<String, AjaxRejection> {
     #[derive(Deserialize)]
@@ -324,6 +333,7 @@ fn parse_ajax_body(json: &str) -> Result<String, AjaxRejection> {
         "ok" => Ok(parsed.body.unwrap_or_default()),
         "no_permission" => Err(AjaxRejection::NoPermission),
         "wrong_token7" => Err(AjaxRejection::WrongToken),
+        other if GONE_STATUSES.contains(&other) => Err(AjaxRejection::Gone(other.to_string())),
         other => Err(AjaxRejection::Other(other.to_string())),
     }
 }
@@ -343,6 +353,10 @@ mod tests {
         assert_eq!(
             parse_ajax_body(r#"{"status":"wrong_token7","message":"no","CURRENT_TIMESTAMP":1}"#),
             Err(AjaxRejection::WrongToken)
+        );
+        assert_eq!(
+            parse_ajax_body(r#"{"status":"revision_error","message":"Error accessing revisions"}"#),
+            Err(AjaxRejection::Gone("revision_error".into()))
         );
         assert!(matches!(
             parse_ajax_body(r#"{"status":"internal_error"}"#),

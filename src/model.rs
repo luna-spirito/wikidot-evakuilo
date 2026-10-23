@@ -64,6 +64,11 @@ pub enum FetchError {
     NotFound,
     #[error("forbidden / no permission")]
     Forbidden,
+    /// The server itself confirmed this specific object can never be served
+    /// (e.g. AJAX `revision_error`): terminal like NotFound/Forbidden, but
+    /// carries the server's status name for the denial record.
+    #[error("gone: {0}")]
+    Gone(String),
     #[error("http error: {0}")]
     Http(String),
     #[error("parse error: {0}")]
@@ -71,9 +76,12 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    /// v1 `is_retryable`: everything but NotFound/Forbidden.
+    /// v1 `is_retryable`: everything but NotFound/Forbidden/Gone.
     pub fn retryable(&self) -> bool {
-        !matches!(self, FetchError::NotFound | FetchError::Forbidden)
+        !matches!(
+            self,
+            FetchError::NotFound | FetchError::Forbidden | FetchError::Gone(_)
+        )
     }
 
     /// v1 `backoff_ms`: Timeout 10s, RateLimited 30s, Parse/Http 5s.

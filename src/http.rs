@@ -192,6 +192,46 @@ impl CookieJar {
     }
 }
 
+// ── Host health ──
+
+/// How the client currently regards a URL's host. RAM-only, per process:
+/// terminal row states in the DB never derive from it — only from a server
+/// response — so a false mark costs skipped requests until it expires, never
+/// archived falsehood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostHealth {
+    /// No adverse knowledge (the default).
+    Alive,
+    /// Repeated transport-level failures (DNS dead, refused): skip fetching
+    /// for a short TTL, then let one probe through. Never terminal.
+    Unreachable,
+    /// A fetched body proved the whole origin unobtainable — "The site does
+    /// not exist" (deleted) or "Not authorized" (private, and we hold no
+    /// credentials there). Long TTL; every URL on the host would answer the
+    /// same page, so probing them one by one is pure waste.
+    Gone,
+}
+
+/// How long a `Gone` mark lives. Effectively "rest of the process"; the
+/// expiry only bounds staleness if a deleted site ever comes back.
+const GONE_TTL_SECS: i64 = 30 * 24 * 3600;
+/// How long transport failures suppress a host. Short: an outage must
+/// self-heal without a restart, and one real probe per window is cheap.
+const UNREACHABLE_TTL_SECS: i64 = 30 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostMark {
+    gone: bool,
+    until: i64,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 // ── Client ──
 
 /// Max hops a manually-followed POST redirect chain may take.
@@ -215,6 +255,8 @@ pub struct Wikidot {
     /// Serializes CSRF bootstrap per site: without it, N concurrent workers
     /// with a cold session each burn a GET on token refresh.
     token_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Host health marks (see `HostHealth`): host → (gone?, expiry).
+    host_marks: Mutex<HashMap<String, HostMark>>,
     timeout: Duration,
 }
 
@@ -235,6 +277,7 @@ impl Wikidot {
             schemes: Mutex::new(HashMap::new()),
             stores: Mutex::new(HashMap::new()),
             token_gates: Mutex::new(HashMap::new()),
+            host_marks: Mutex::new(HashMap::new()),
             timeout: Duration::from_secs(timeout_s),
         })
     }
@@ -280,7 +323,15 @@ impl Wikidot {
         if let Some(cookie) = self.cookie_header(site) {
             req = req.header("cookie", cookie);
         }
-        let resp = req.send().await.map_err(map_reqwest_err)?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if e.is_connect() {
+                    self.mark_host_unreachable(url);
+                }
+                return Err(map_reqwest_err(e));
+            }
+        };
         self.absorb_cookies(site, &resp);
         self.remember_scheme(site, &resp);
         check_status(resp).await
@@ -294,7 +345,15 @@ impl Wikidot {
     pub async fn get_public(&self, url: &str, prio: i64) -> Result<reqwest::Response, FetchError> {
         self.limiter.acquire(prio).await;
         let req = self.http.get(url).timeout(self.timeout);
-        let resp = req.send().await.map_err(map_reqwest_err)?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if e.is_connect() {
+                    self.mark_host_unreachable(url);
+                }
+                return Err(map_reqwest_err(e));
+            }
+        };
         check_status(resp).await
     }
 
@@ -322,7 +381,15 @@ impl Wikidot {
             if let Some(cookie) = self.cookie_header(site) {
                 req = req.header("cookie", cookie);
             }
-            let resp = req.send().await.map_err(map_reqwest_err)?;
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if e.is_connect() {
+                        self.mark_host_unreachable(current.as_str());
+                    }
+                    return Err(map_reqwest_err(e));
+                }
+            };
             self.absorb_cookies(site, &resp);
             self.remember_scheme(site, &resp);
             if !resp.status().is_redirection() {
@@ -394,6 +461,60 @@ impl Wikidot {
             .entry(site.to_string())
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Current health of a URL's host (Alive for relative/junk paths).
+    /// An expired mark is discarded here — lookup is the only reader.
+    pub fn host_health(&self, url: &str) -> HostHealth {
+        let Some(host) = crate::parsers::url_host(url) else {
+            return HostHealth::Alive;
+        };
+        let mut marks = self.host_marks.lock();
+        match marks.get(&host) {
+            Some(mark) if mark.until > unix_now() => {
+                if mark.gone {
+                    HostHealth::Gone
+                } else {
+                    HostHealth::Unreachable
+                }
+            }
+            Some(_) => {
+                marks.remove(&host);
+                HostHealth::Alive
+            }
+            None => HostHealth::Alive,
+        }
+    }
+
+    /// Record that a fetched body proved the origin itself unobtainable
+    /// (deleted site / private site we hold no credentials for). Every URL
+    /// on the host would answer the same error page, so further fetches on
+    /// it are skipped for a long TTL instead of replaying the proof.
+    pub fn mark_host_gone(&self, url: &str) {
+        self.mark_host(url, true, GONE_TTL_SECS);
+    }
+
+    /// Record a transport-level failure (connect/DNS) for the URL's host:
+    /// suppress it for a short TTL. Timeouts deliberately do NOT mark — a
+    /// slow-but-alive host must not get suppressed.
+    fn mark_host_unreachable(&self, url: &str) {
+        self.mark_host(url, false, UNREACHABLE_TTL_SECS);
+    }
+
+    fn mark_host(&self, url: &str, gone: bool, ttl_secs: i64) {
+        let Some(host) = crate::parsers::url_host(url) else {
+            return;
+        };
+        let mut marks = self.host_marks.lock();
+        // Never downgrade: a Gone mark outweighs a fresher unreachable one.
+        let merged = match marks.get(&host) {
+            Some(existing) if existing.gone => *existing,
+            _ => HostMark {
+                gone,
+                until: unix_now() + ttl_secs,
+            },
+        };
+        marks.insert(host, merged);
     }
 
     fn absorb_cookies(&self, site: &str, resp: &reqwest::Response) {
@@ -691,6 +812,34 @@ mod tests {
         );
         // Every hop was a real request, none past the cap.
         assert_eq!(mock.requests().len(), POST_REDIRECT_HOPS);
+    }
+
+    #[tokio::test]
+    async fn host_health_marks_expire_and_never_downgrade() {
+        let wik = Wikidot::new(1, 5).unwrap();
+        // Unknown / unparseable URLs are alive.
+        assert_eq!(wik.host_health("http://dead.example/x.png"), HostHealth::Alive);
+        assert_eq!(wik.host_health("relative/path"), HostHealth::Alive);
+
+        // Gone marks the host for a long TTL.
+        wik.mark_host_gone("http://dead.example/local--files/a/b.png");
+        assert_eq!(wik.host_health("http://dead.example/other.png"), HostHealth::Gone);
+
+        // An unreachable mark never downgrades a gone one…
+        let gone = *wik.host_marks.lock().get("dead.example").unwrap();
+        wik.mark_host("http://dead.example/x", false, 1);
+        assert_eq!(*wik.host_marks.lock().get("dead.example").unwrap(), gone);
+
+        // …and expiry (simulated) returns the host to Alive, with the mark
+        // discarded on lookup.
+        wik.mark_host("http://flaky.example/x", false, 0); // until = now
+        wik.host_marks
+            .lock()
+            .get_mut("flaky.example")
+            .unwrap()
+            .until = unix_now() - 1;
+        assert_eq!(wik.host_health("http://flaky.example/x"), HostHealth::Alive);
+        assert!(!wik.host_marks.lock().contains_key("flaky.example"));
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use crate::{
     blobs,
     config::Config,
     db::{self, Db, enqueue_on},
-    http::Wikidot,
+    http::{HostHealth, Wikidot},
     jobs,
     model::{ChangeEntry, FetchError, Slug},
     out, parsers,
@@ -51,6 +51,19 @@ fn complete_ephemeral(effects: Effects) -> Outcome {
 
 fn noop_effects() -> Effects {
     Box::new(|_| Ok(()))
+}
+
+/// Effects marking a files-row terminally `missing` (deleted upstream,
+/// dead/private origin). Terminal rows never re-attempt.
+fn missing_effects(path: String) -> Effects {
+    Box::new(move |tx| {
+        tx.execute(
+            "INSERT INTO files(path, status, first_seen) VALUES(?1, 'missing', ?2)
+             ON CONFLICT(path) DO UPDATE SET status='missing'",
+            params![path, db::now()],
+        )?;
+        Ok(())
+    })
 }
 
 fn fail_err(e: &FetchError) -> Outcome {
@@ -291,8 +304,18 @@ async fn revision_fetch(
                 p.rev_id
             )));
         }
-        Err(FetchError::Forbidden) => {
-            // Permanently private revision: record it (v1 `revs_denied`).
+        Err(e @ (FetchError::Forbidden | FetchError::Gone(_))) => {
+            // Permanently unobtainable revision, recorded terminally (v1
+            // `revs_denied`): private (`no_permission`), or the server
+            // itself cannot serve it (AJAX `revision_error` — deterministic
+            // per revision; without this row the hourly backfill would
+            // re-arm the fetch forever, hammering Wikidot for nothing).
+            let reason = match &e {
+                FetchError::Forbidden => "no_permission".to_string(),
+                FetchError::Gone(status) => format!("gone:{status}"),
+                _ => unreachable!("matched arms are exhaustive"),
+            };
+            tracing::warn!(site = %api.site, page_id = p.page_id, rev = p.rev_no, %reason, "revision denied");
             let (ts, author) = db
                 .revision_state(p.page_id, p.rev_no)
                 .ok()
@@ -302,12 +325,11 @@ async fn revision_fetch(
             let effects: Effects = Box::new(move |tx| {
                 tx.execute(
                     "INSERT OR REPLACE INTO denied_revisions(page_id, rev_no, rev_id, ts, author, reason)
-                     VALUES(?1, ?2, ?3, ?4, ?5, 'no_permission')",
-                    params![p.page_id, p.rev_no, p.rev_id, ts, author],
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![p.page_id, p.rev_no, p.rev_id, ts, author, reason],
                 )?;
                 Ok(())
             });
-            tracing::warn!(site = %api.site, page_id = p.page_id, rev = p.rev_no, "revision denied");
             return Ok(complete(None, effects));
         }
         Err(e) => return Err(e),
@@ -359,6 +381,27 @@ async fn file_fetch(
         _ => {}
     }
 
+    // RAM host-health short-circuit: an origin a fetched body already
+    // proved unobtainable (deleted/private site) answers every path on it
+    // with the same error page — no point spending a rate-limit ticket per
+    // file to relearn that. An origin suppressed by transport failures
+    // (NXDOMAIN, refused) is skipped the same way, but as a *transient*
+    // verdict: dead-letter now, one log line, and the periodic backfill's
+    // hourly re-arm lets a real probe through once the TTL lapses.
+    match api.wik.host_health(&p.path) {
+        HostHealth::Gone => {
+            tracing::info!(site = %api.site, path = %p.path, "attachment missing (origin gone)");
+            return Ok(complete(None, missing_effects(p.path)));
+        }
+        HostHealth::Unreachable => {
+            return Ok(Outcome::Fail {
+                error: "host unreachable (recent transport failures)".into(),
+                permanent: true,
+            });
+        }
+        HostHealth::Alive => {}
+    }
+
     // Row keys are canonical absolute URLs. Hosts on THIS site (either
     // spelling — `{site}.wikidot.com`, `{site}.wdfiles.com`) fetch through
     // the main domain with the site session, exactly like the old
@@ -381,46 +424,29 @@ async fn file_fetch(
         Ok(b) => b,
         Err(FetchError::NotFound) => {
             // Deleted upstream (v1 `failed_files`): permanent, recorded.
-            let path = p.path.clone();
-            let effects: Effects = Box::new(move |tx| {
-                tx.execute(
-                    "INSERT INTO files(path, status, first_seen) VALUES(?1, 'missing', ?2)
-                     ON CONFLICT(path) DO UPDATE SET status='missing'",
-                    params![path, db::now()],
-                )?;
-                Ok(())
-            });
             tracing::info!(site = %api.site, path = %p.path, "attachment missing (404)");
-            return Ok(complete(None, effects));
+            return Ok(complete(None, missing_effects(p.path)));
         }
         Err(e) => return Err(e),
     };
 
-    // Wikidot answers a nonexistent file with HTTP 200 + an HTML error page
-    // (never localized, never a real attachment media type): that must not
-    // be archived as the asset. "The file does not exist" is the terminal
-    // soft-404; any other HTML body (a "408 Request Time-out" page served
-    // as 200, …) is transient — surface as an error so the queue retries.
+    // Wikidot answers a missing file with HTTP 200 + a title-stamped HTML
+    // error page (`The file does not exist`, or for the whole origin
+    // `The site does not exist` / `Not authorized`) — classified terminally
+    // below. Any OTHER HTML body is a real attachment (`.php`/`.html` files
+    // are served as text/html with full content) and falls through to be
+    // archived like any bytes.
     if header_type.as_deref() == Some("text/html") {
         let page = String::from_utf8_lossy(&bytes);
-        if page.contains("The file does not exist") {
-            let path = p.path.clone();
-            let effects: Effects = Box::new(move |tx| {
-                tx.execute(
-                    "INSERT INTO files(path, status, first_seen) VALUES(?1, 'missing', ?2)
-                     ON CONFLICT(path) DO UPDATE SET status='missing'",
-                    params![path, db::now()],
-                )?;
-                Ok(())
-            });
-            tracing::info!(site = %api.site, path = %p.path, "attachment missing (soft 404)");
-            return Ok(complete(None, effects));
+        if let Some(kind) = parsers::html_error_page_kind(&page) {
+            if kind != "file" {
+                // The origin itself is unobtainable: every URL on the host
+                // answers the same page, so the rest skip the proof.
+                api.wik.mark_host_gone(&p.path);
+            }
+            tracing::info!(site = %api.site, path = %p.path, kind, "attachment missing (HTML error page)");
+            return Ok(complete(None, missing_effects(p.path)));
         }
-        return Err(FetchError::Http(format!(
-            "html error page for {}: {}",
-            p.path,
-            page.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
-        )));
     }
 
     // wdfiles intermittently answers 200 with an EMPTY body (observed
@@ -562,6 +588,18 @@ async fn theme_crawl(
         let from_blob = from_blob.clone();
         async move {
             let (path, row_url) = parsers::file_row_paths(&api.site, &url);
+            match api.wik.host_health(&url) {
+                // Origin proved gone: every URL on it answers the same
+                // error page — record missing, don't descend, no ticket.
+                HostHealth::Gone => {
+                    missing.lock().push(path);
+                    return None;
+                }
+                // Suppressed after transport failures: failed URL, the
+                // next crawl re-arms it once the TTL lapses.
+                HostHealth::Unreachable => return None,
+                HostHealth::Alive => {}
+            }
             if let Ok(Some((status, sha))) = db.file_row(&path)
                 && status == "saved"
                 && let Some(sha) = sha
@@ -618,19 +656,23 @@ async fn theme_crawl(
             asset_ok += 1;
             continue;
         }
-        match api.fetch_public(url).await {
-            Ok((bytes, content_type)) => {
-                let size = bytes.len() as i64;
-                match blobs::write_blob(out_dir, &bytes) {
-                    Ok(sha) => {
-                        saved.lock().push((path, row_url, sha, size, content_type));
-                        asset_ok += 1;
+        match api.wik.host_health(url) {
+            HostHealth::Gone => missing.lock().push(path),
+            HostHealth::Unreachable => asset_failed.push(url.clone()),
+            HostHealth::Alive => match api.fetch_public(url).await {
+                Ok((bytes, content_type)) => {
+                    let size = bytes.len() as i64;
+                    match blobs::write_blob(out_dir, &bytes) {
+                        Ok(sha) => {
+                            saved.lock().push((path, row_url, sha, size, content_type));
+                            asset_ok += 1;
+                        }
+                        Err(_) => asset_failed.push(url.clone()),
                     }
-                    Err(_) => asset_failed.push(url.clone()),
                 }
-            }
-            Err(FetchError::NotFound) => missing.lock().push(path),
-            Err(_) => asset_failed.push(url.clone()),
+                Err(FetchError::NotFound) => missing.lock().push(path),
+                Err(_) => asset_failed.push(url.clone()),
+            },
         }
     }
 
