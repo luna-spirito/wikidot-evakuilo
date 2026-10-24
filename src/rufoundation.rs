@@ -92,7 +92,9 @@ struct LogEntry {
 
 #[derive(Debug, Deserialize)]
 struct LogUser {
-    id: i64,
+    /// `null` for the synthetic `type: "system"` user (wiki setup, file
+    /// seed): those entries are not authored by anyone.
+    id: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -124,7 +126,7 @@ impl LogEntry {
     }
 
     fn author(&self) -> i64 {
-        self.user.as_ref().map_or(0, |u| u.id)
+        self.user.as_ref().and_then(|u| u.id).unwrap_or(0)
     }
 }
 
@@ -291,13 +293,15 @@ impl<'a> RuApi<'a> {
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> FetchResult<T> {
         let url = self.url(path);
         self.retryable(&format!("GET {path}"), || async {
-            let resp = self.wik.get_api(&url, self.bearer.as_deref(), self.prio).await?;
+            let resp = self
+                .wik
+                .get_api(&url, self.bearer.as_deref(), self.prio)
+                .await?;
             let body = resp
                 .text()
                 .await
                 .map_err(|e| FetchError::Http(e.to_string()))?;
-            serde_json::from_str(&body)
-                .map_err(|e| FetchError::Parse(format!("{path}: {e}")))
+            serde_json::from_str(&body).map_err(|e| FetchError::Parse(format!("{path}: {e}")))
         })
         .await
     }
@@ -311,7 +315,8 @@ impl<'a> RuApi<'a> {
     }
 
     async fn fetch_log(&self, slug: &str) -> FetchResult<Log> {
-        self.get_json(&format!("/api/articles/{slug}/log?all=1")).await
+        self.get_json(&format!("/api/articles/{slug}/log?all=1"))
+            .await
     }
 
     async fn fetch_version(&self, slug: &str, rev_no: i64) -> FetchResult<String> {
@@ -331,7 +336,11 @@ impl<'a> RuApi<'a> {
     /// Redirects to the media domain are the server's business (public
     /// bytes; reqwest already strips the Authorization header on the hop).
     async fn fetch_file(&self, url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
-        let bearer = if self.is_own(url) { self.bearer.as_deref() } else { None };
+        let bearer = if self.is_own(url) {
+            self.bearer.as_deref()
+        } else {
+            None
+        };
         self.retryable(&format!("attachment {url}"), || async {
             let resp = self.wik.get_api(url, bearer, self.prio).await?;
             let content_type = crate::wikidot::media_type(resp.headers());
@@ -432,8 +441,7 @@ async fn discover(db: &Db, cfg: &Config, api: &RuApi<'_>) -> Result<Outcome, Fet
             // stays stable whatever `updatedAt` semantically tracks
             // upstream.
             let mut j = jobs::page_sync(&slug);
-            j.payload =
-                serde_json::json!({ "slug": slug, "updated_at": updated_at }).to_string();
+            j.payload = serde_json::json!({ "slug": slug, "updated_at": updated_at }).to_string();
             j
         })
         .collect();
@@ -527,7 +535,9 @@ async fn page_sync(db: &Db, api: &RuApi<'_>, job: &db::Job) -> Result<Outcome, F
         let mut file_jobs = Vec::new();
         for r in &new_revs {
             let rev_id = r.version_id.to_string();
-            if Some(r.rev_no) == head && let Some(src) = &head_source {
+            if Some(r.rev_no) == head
+                && let Some(src) = &head_source
+            {
                 // Store the head content that arrived with the article,
                 // mine it for file refs, skip its fetch job. The upsert is
                 // idempotent against a racing sync (content kept if set).
@@ -676,7 +686,9 @@ async fn file_fetch(
         .map_err(|e| FetchError::Parse(format!("bad payload: {e}")))?;
 
     match db.file_status(&p.path).ok().flatten().as_deref() {
-        Some("saved") | Some("missing") => return Ok(workers::complete(None, workers::noop_effects())),
+        Some("saved") | Some("missing") => {
+            return Ok(workers::complete(None, workers::noop_effects()));
+        }
         _ => {}
     }
 
@@ -791,7 +803,10 @@ mod tests {
     #[test]
     fn iso8601_known_values() {
         // The exact Django shape the live API emits (µs fraction, offset).
-        assert_eq!(parse_iso8601("2026-09-15T16:57:11.917538+00:00"), Some(1789491431));
+        assert_eq!(
+            parse_iso8601("2026-09-15T16:57:11.917538+00:00"),
+            Some(1789491431)
+        );
         assert_eq!(parse_iso8601("2004-03-01T00:00:00+03:30"), Some(1078086600));
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso8601("1970-01-01T00:00:00"), Some(0));
@@ -803,8 +818,14 @@ mod tests {
 
     #[test]
     fn iso8601_rejects_garbage() {
-        for bad in ["", "yesterday", "2026-09-15", "2026-13-01T00:00:00Z",
-                    "2026-09-15T25:00:00Z", "2026-09-15T16:57:11+25:00"] {
+        for bad in [
+            "",
+            "yesterday",
+            "2026-09-15",
+            "2026-13-01T00:00:00Z",
+            "2026-09-15T25:00:00Z",
+            "2026-09-15T16:57:11+25:00",
+        ] {
             assert_eq!(parse_iso8601(bad), None, "{bad:?}");
         }
     }
@@ -815,12 +836,28 @@ mod tests {
     fn snapshots_above_keeps_only_version_bearing_entries() {
         let log: Log = serde_json::from_value(json_log()).unwrap();
         let revs = snapshots_above(&log.entries, -1);
-        let got: Vec<(i64, i64)> = revs.iter().map(|r| (r.rev_no, r.version_id)).collect();
+        let got: Vec<(i64, i64, i64)> = revs
+            .iter()
+            .map(|r| (r.rev_no, r.version_id, r.author))
+            .collect();
         // newest-first, `new` (rev 0) and `revert` (meta.source.version_id)
-        // included; file/tag entries dropped.
-        assert_eq!(got, vec![(482, 42912), (438, 30991), (0, 8747)]);
+        // included; file/tag entries dropped. The system-user snapshot (id
+        // null, e.g. wiki setup) archives with author 0.
+        assert_eq!(
+            got,
+            vec![
+                (482, 42912, 413),
+                (481, 42800, 0),
+                (438, 30991, 41),
+                (0, 8747, 383)
+            ]
+        );
         // Watermark cuts everything at or below it.
-        assert!(snapshots_above(&log.entries, 438).iter().all(|r| r.rev_no > 438));
+        assert!(
+            snapshots_above(&log.entries, 438)
+                .iter()
+                .all(|r| r.rev_no > 438)
+        );
     }
 
     fn json_log() -> serde_json::Value {
@@ -829,6 +866,11 @@ mod tests {
               "user": { "id": 413 }, "meta": { "version_id": 42912 } },
             { "type": "file_added", "revNumber": 478, "createdAt": "2026-08-01T00:00:00+00:00",
               "user": { "id": 413 }, "meta": { "id": 103225, "name": "a.png" } },
+            { "type": "source", "revNumber": 481, "createdAt": "2026-09-10T00:00:00+00:00",
+              "user": { "type": "system", "id": null, "name": null, "username": null,
+                        "isActive": true, "avatar": null, "showAvatar": false,
+                        "admin": false, "staff": false, "editor": false, "roles": null },
+              "meta": { "version_id": 42800 } },
             { "type": "revert", "revNumber": 438, "createdAt": "2024-05-05T00:00:00+00:00",
               "user": { "id": 41 }, "meta": { "source": { "version_id": 30991 } } },
             { "type": "wikidot", "revNumber": 353, "createdAt": "2023-01-01T00:00:00+00:00",
@@ -876,7 +918,11 @@ mod tests {
         let extracted = parsers::extract_file_links_origin(host, src);
         // The bare `[[image name]]` form is not a local--files reference —
         // only the two explicit ones are, and they converge.
-        assert!(extracted.iter().all(|p| p.ends_with("/local--files/main/oversight-cut-logo.png")));
+        assert!(
+            extracted
+                .iter()
+                .all(|p| p.ends_with("/local--files/main/oversight-cut-logo.png"))
+        );
         assert_eq!(extracted.len(), 1);
     }
 
