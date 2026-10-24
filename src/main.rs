@@ -17,6 +17,7 @@ mod jobs;
 mod model;
 mod out;
 mod parsers;
+mod rufoundation;
 mod theme;
 mod wikidot;
 mod workers;
@@ -89,12 +90,13 @@ fn load_config() -> Result<config::Config> {
 
 fn cmd_init() -> Result<()> {
     let cfg = load_config()?;
-    for site in &cfg.instance.sites {
+    for (site, platform) in &cfg.resolved_sites()? {
         let db = db::Db::open(&cfg.site_db(site))?;
         let seeded = db.enqueue(&jobs::seed_periodic())?;
         println!(
-            "{}: {} ({} new periodic job{})",
+            "{} [{}]: {} ({} new periodic job{})",
             site,
+            platform.label(),
             cfg.site_db(site).display(),
             seeded,
             if seeded == 1 { "" } else { "s" }
@@ -105,16 +107,13 @@ fn cmd_init() -> Result<()> {
 
 fn cmd_status() -> Result<()> {
     let cfg = load_config()?;
-    println!(
-        "instance {} ({} sites)",
-        cfg.instance.name,
-        cfg.instance.sites.len()
-    );
+    let resolved = cfg.resolved_sites()?;
+    println!("instance {} ({} sites)", cfg.instance.name, resolved.len());
     println!(
         "rate limit: 1 req / {} ms (global), timeout {}s",
         cfg.rate_limit_ms, cfg.timeout_s
     );
-    for site in &cfg.instance.sites {
+    for (site, platform) in &resolved {
         let db_path = cfg.site_db(site);
         match db::Db::open_read_only(&db_path) {
             Ok(db) => {
@@ -128,7 +127,7 @@ fn cmd_status() -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(" ")
                 };
-                println!("\n{site}:");
+                println!("\n{site} [{}]:", platform.label());
                 println!("  db: {}", db_path.display());
                 println!("  jobs: {jobs}");
                 println!(
@@ -146,7 +145,7 @@ fn cmd_status() -> Result<()> {
                     println!("  DEAD {kind}: {err}");
                 }
             }
-            Err(_) => println!("\n{site}: no database yet ({})", db_path.display()),
+            Err(_) => println!("\n{site} [{}]: no database yet ({})", platform.label(), db_path.display()),
         }
     }
     Ok(())

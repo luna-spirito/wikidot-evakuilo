@@ -51,7 +51,7 @@ pub fn run(cfg: &Config, from: &Path) -> Result<()> {
             repo.display()
         );
     }
-    for site in &cfg.instance.sites {
+    for (site, _) in &cfg.resolved_sites()? {
         let site_dir = repo.join(site);
         if !site_dir.is_dir() {
             eprintln!("  {site}: no legacy tree (skipped)");

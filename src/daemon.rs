@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use tokio::sync::Semaphore;
 
-use crate::{config::Config, db::Db, http::Wikidot, jobs, workers};
+use crate::{config::Platform, config::Config, db::Db, http::Wikidot, jobs, workers};
 
 const SITE_CONCURRENCY: usize = 4;
 
@@ -19,7 +19,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let mut locks = Vec::new();
     let mut handles = Vec::new();
-    for site in cfg.instance.sites.clone() {
+    for (site, platform) in cfg.resolved_sites()? {
         // One unreachable site must not take the others down with it.
         let (db, lock) = match Db::open_locked(&cfg.site_db(&site)) {
             Ok(opened) => opened,
@@ -39,11 +39,13 @@ pub async fn run(cfg: Config) -> Result<()> {
         if seeded > 0 {
             tracing::info!(site, seeded, "seeded periodic jobs");
         }
-        // Keep the session across restarts: load the persisted cookies
-        // (CSRF token incl.) now, persist changes as they arrive.
-        wik.attach_store(&site, db.clone());
+        // Wikidot sites keep a cookie session across restarts (CSRF token
+        // incl.); RuFoundation sites authenticate per request.
+        if matches!(platform, Platform::Wikidot) {
+            wik.attach_store(&site, db.clone());
+        }
         locks.push(lock);
-        let handle = tokio::spawn(site_worker(cfg.clone(), Arc::clone(&wik), db, site));
+        let handle = tokio::spawn(site_worker(cfg.clone(), Arc::clone(&wik), db, site, platform));
         handles.push(handle);
     }
     if handles.is_empty() {
@@ -60,7 +62,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-async fn site_worker(cfg: Config, wik: Arc<Wikidot>, db: Db, site: String) {
+async fn site_worker(cfg: Config, wik: Arc<Wikidot>, db: Db, site: String, platform: Platform) {
     let semaphore = Arc::new(Semaphore::new(SITE_CONCURRENCY));
     loop {
         let claimed = match db.claim(1) {
@@ -89,10 +91,11 @@ async fn site_worker(cfg: Config, wik: Arc<Wikidot>, db: Db, site: String) {
         let wik = Arc::clone(&wik);
         let db = db.clone();
         let site = site.clone();
+        let platform = platform.clone();
         tokio::spawn(async move {
             let job_id = job.id;
             let kind = job.kind.clone();
-            let outcome = workers::run_job(&db, &cfg, &wik, &site, &job).await;
+            let outcome = workers::run_job(&db, &cfg, &wik, &site, &platform, &job).await;
             let result = match outcome {
                 workers::Outcome::Complete { resched, effects } => {
                     db.complete(job_id, resched, |tx| effects(tx))

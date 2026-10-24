@@ -18,6 +18,8 @@ zstd_level = 19
 [instance]
 name = "kolorinko"
 sites = [
-      "obscurative"
-    , "rpcauthority"
+      { type = "wikidot", host = "obscurative" }
+    , { type = "wikidot", host = "rpcauthority" }
+    , { type = "rufoundation", host = "www.backroomswiki.ru" }
+    , { type = "rufoundation", host = "castopia.site" }
 ]

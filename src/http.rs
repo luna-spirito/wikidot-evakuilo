@@ -343,8 +343,25 @@ impl Wikidot {
     /// polluted by) other hosts. Shares the global limiter: one politeness
     /// budget for all hosts.
     pub async fn get_public(&self, url: &str, prio: i64) -> Result<reqwest::Response, FetchError> {
+        self.get_api(url, None, prio).await
+    }
+
+    /// Rate-limited GET of a first-party API document (the RuFoundation
+    /// JSON API): `get_public` plus an optional bearer token. No site
+    /// session in either direction — the token rides per request and is
+    /// never persisted; transport failures mark the host like every other
+    /// GET.
+    pub async fn get_api(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        prio: i64,
+    ) -> Result<reqwest::Response, FetchError> {
         self.limiter.acquire(prio).await;
-        let req = self.http.get(url).timeout(self.timeout);
+        let mut req = self.http.get(url).timeout(self.timeout);
+        if let Some(key) = bearer {
+            req = req.bearer_auth(key);
+        }
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(e) => {
@@ -686,16 +703,17 @@ mod tests {
 
     impl MockOrigin {
         /// `build` receives the bound address so redirect targets can lead
-        /// back to the mock itself.
+        /// back to the mock itself. One accept loop serves the responses in
+        /// order, one connection each — concurrent accept threads made the
+        /// request log racy under a parallel test run.
         fn serve(build: impl FnOnce(std::net::SocketAddr) -> Vec<String>) -> MockOrigin {
-            let listener = Arc::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let responses = build(addr);
             let thread_log = Arc::clone(&log);
-            for response in build(addr) {
-                let listener = Arc::clone(&listener);
-                let thread_log = Arc::clone(&thread_log);
-                std::thread::spawn(move || {
+            std::thread::spawn(move || {
+                for response in responses {
                     let Ok((mut sock, _)) = listener.accept() else { return };
                     let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
                     // Read until the head is complete, then honor
@@ -712,12 +730,10 @@ mod tests {
                                     let len = String::from_utf8_lossy(&raw[..pos])
                                         .lines()
                                         .find_map(|l| {
-                                            let v = l.strip_prefix("Content-Length:")?
+                                            l.strip_prefix("Content-Length:")?
                                                 .trim()
                                                 .parse::<usize>()
                                                 .ok()
-                                            ;
-                                            v
                                         })
                                         .unwrap_or(0);
                                     if raw.len() >= pos + 4 + len {
@@ -731,8 +747,8 @@ mod tests {
                         .lock()
                         .push(String::from_utf8_lossy(&raw).into_owned());
                     let _ = sock.write_all(response.as_bytes());
-                });
-            }
+                }
+            });
             MockOrigin { addr, log }
         }
 

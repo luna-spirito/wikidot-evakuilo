@@ -212,6 +212,39 @@ pub fn file_row_paths(site: &str, url: &str) -> (String, String) {
     }
 }
 
+/// Row mapping for a plain-origin site (RuFoundation): URLs on the site's
+/// own host — `www.`-prefixed or not, either scheme — fold onto the
+/// canonical `https://{host}` spelling (the configured one) with `%3A`
+/// decoded (page slugs are `category:name`); every other host — CDNs, the
+/// site's media file domain (an implementation detail of file serving, a
+/// redirect target, not a spelling of the namespace) — keeps its URL
+/// verbatim. `path` and `url` coincide for own-host rows: the canonical
+/// spelling is also where the bytes are addressed.
+pub fn file_row_paths_own(host: &str, url: &str) -> (String, String) {
+    let target = host.to_ascii_lowercase();
+    let bare_target = target.strip_prefix("www.").unwrap_or(&target).to_string();
+    match url::Url::parse(url) {
+        Ok(u) => {
+            let lower = u.host_str().unwrap_or_default().to_ascii_lowercase();
+            let bare = lower.strip_prefix("www.").unwrap_or(&lower);
+            if matches!(u.scheme(), "http" | "https") && *bare == bare_target {
+                let mut out = format!("https://{target}{}", decode_colons(u.path()));
+                if let Some(q) = u.query().filter(|q| !q.is_empty()) {
+                    out.push('?');
+                    out.push_str(q);
+                }
+                (out.clone(), out)
+            } else {
+                let mut u = u;
+                u.set_fragment(None);
+                let verbatim = u.to_string();
+                (verbatim.clone(), verbatim)
+            }
+        }
+        Err(_) => (url.to_string(), url.to_string()),
+    }
+}
+
 /// Canonical `http://{slug}.wikidot.com{path}?{query}` when `u` sits on a
 /// Wikidot-operated host: this site's own hosts, or any
 /// `{slug}.wikidot.com` / `{slug}.wdfiles.com` (cross-site references —
@@ -401,6 +434,52 @@ pub fn extract_page_files(site: &str, html: &str) -> Vec<String> {
 /// site-relative and lift onto `http://{site}.wikidot.com` — so a row key
 /// always names exactly one file no matter how the wikitext spelled it.
 pub fn extract_file_links(site: &str, content: &str) -> Vec<String> {
+    extract_refs(&RefOrigin::Wikidot(site.to_string()), content)
+}
+
+/// Same extraction for a plain-origin site (RuFoundation): site-relative
+/// references lift onto `https://{host}` and only that host's own
+/// spellings canonicalize; see `file_row_paths_own`.
+pub fn extract_file_links_origin(host: &str, content: &str) -> Vec<String> {
+    extract_refs(&RefOrigin::Host(host.to_string()), content)
+}
+
+/// The origin wikitext file references are resolved against.
+#[derive(Clone)]
+enum RefOrigin {
+    /// Wikidot site slug: `{slug}.wikidot.com` / `{slug}.wdfiles.com`, any
+    /// site of the fleet canonicalizes.
+    Wikidot(String),
+    /// One plain host (RuFoundation): only that host canonicalizes.
+    Host(String),
+}
+
+impl RefOrigin {
+    /// Canonical `(path, url)` row pair of a full URL.
+    fn row_key(&self, url: &str) -> (String, String) {
+        match self {
+            RefOrigin::Wikidot(site) => file_row_paths(site, url),
+            RefOrigin::Host(host) => file_row_paths_own(host, url),
+        }
+    }
+
+    /// Canonical row key of a site-relative `local--files/…` tail, lifted
+    /// onto the site's origin and pushed through the same
+    /// canonicalization as absolute references, so a `%3A`-spelled slug
+    /// converges with its `:` twin.
+    fn lift(&self, tail: &str) -> String {
+        match self {
+            RefOrigin::Wikidot(site) => self
+                .row_key(&format!("http://{site}.wikidot.com/local--files/{tail}"))
+                .0,
+            RefOrigin::Host(host) => self
+                .row_key(&format!("https://{host}/local--files/{tail}"))
+                .0,
+        }
+    }
+}
+
+fn extract_refs(origin: &RefOrigin, content: &str) -> Vec<String> {
     let parts: Vec<&str> = content.split("local--files/").collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -410,8 +489,8 @@ pub fn extract_file_links(site: &str, content: &str) -> Vec<String> {
             continue;
         }
         let path = match absolute_base_before(pair[0]) {
-            Some(base) => file_row_paths(site, &format!("{base}/local--files/{taken}")).0,
-            None => own_file_url(site, &taken),
+            Some(base) => origin.row_key(&format!("{base}/local--files/{taken}")).0,
+            None => origin.lift(&taken),
         };
         if seen.insert(path.clone()) {
             out.push(path);
@@ -886,6 +965,51 @@ WIKIREQUEST.info.pageId = 1457213925;
                 r#"<a href="/local--files/component%3Atheme/x.css">t</a>"#
             ),
             vec!["http://demo.wikidot.com/local--files/component:theme/x.css".to_string()]
+        );
+    }
+
+    /// RuFoundation origin: own-host spellings (bare/www, either scheme)
+    /// fold onto the configured host; foreign hosts and the site's media
+    /// domain stay verbatim; bare references lift onto `https://{host}`.
+    #[test]
+    fn own_origin_rows_fold_only_the_configured_host() {
+        let host = "www.backroomswiki.ru";
+        let key = |url: &str| file_row_paths_own(host, url).0;
+        assert_eq!(
+            key("https://backroomswiki.ru/local--files/main/logo.png"),
+            "https://www.backroomswiki.ru/local--files/main/logo.png"
+        );
+        assert_eq!(
+            key("http://www.backroomswiki.ru/local--files/main/logo.png#x"),
+            "https://www.backroomswiki.ru/local--files/main/logo.png"
+        );
+        // Media domain and third parties keep their URL.
+        assert_eq!(
+            key("https://files.backroomswiki.ru/local--files/main/logo.png"),
+            "https://files.backroomswiki.ru/local--files/main/logo.png"
+        );
+        assert_eq!(
+            key("https://cdn.example.net/a/b.png"),
+            "https://cdn.example.net/a/b.png"
+        );
+        // Wikidot cross-references stay Wikidot URLs, untouched.
+        assert_eq!(
+            key("http://sandbox.wikidot.com/local--files/x/1.png"),
+            "http://sandbox.wikidot.com/local--files/x/1.png"
+        );
+        // Bare references lift; %3A converges with ':'.
+        assert_eq!(
+            extract_file_links_origin(host, "img /local--files/main/logo.png and local--files/archived%3Aentity-65/рендер.png"),
+            vec![
+                "https://www.backroomswiki.ru/local--files/main/logo.png".to_string(),
+                "https://www.backroomswiki.ru/local--files/archived:entity-65/%D1%80%D0%B5%D0%BD%D0%B4%D0%B5%D1%80.png".to_string(),
+            ]
+        );
+        // An absolute own-host spelling converges with the bare one.
+        let src = "a https://backroomswiki.ru/local--files/main/logo.png b /local--files/main/logo.png";
+        assert_eq!(
+            extract_file_links_origin(host, src).len(),
+            1
         );
     }
 

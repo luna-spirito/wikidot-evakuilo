@@ -295,7 +295,7 @@ impl<'a> SiteApi<'a> {
 
 /// `Content-Type` header value with its parameters stripped
 /// (`text/css; charset=utf-8` → `text/css`), or None if absent/invalid.
-fn media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let raw = headers.get(reqwest::header::CONTENT_TYPE)?.to_str().ok()?;
     let mime = raw.split(';').next()?.trim();
     (!mime.is_empty()).then(|| mime.to_ascii_lowercase())

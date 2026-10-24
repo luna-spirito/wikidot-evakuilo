@@ -918,6 +918,31 @@ impl Db {
             .is_some())
     }
 
+    /// A page's current slug — RuFoundation `revision.fetch` needs it to
+    /// address the per-page API. None if the page is unknown.
+    pub fn page_slug(&self, page_id: i64) -> Result<Option<String>> {
+        let conn = self.0.lock();
+        Ok(conn
+            .query_row(
+                "SELECT slug FROM pages WHERE page_id=?1",
+                params![page_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `(slug, COALESCE(updated_at, 0))` of every known page — the diff
+    /// baseline for discovery models that list a per-page watermark
+    /// (RuFoundation `updatedAt`) instead of a change feed.
+    pub fn pages_watermarks(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare("SELECT slug, COALESCE(updated_at, 0) FROM pages")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// `files.status` for a path; None if the row is absent.
     pub fn file_status(&self, path: &str) -> Result<Option<String>> {
         let conn = self.0.lock();

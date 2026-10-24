@@ -9,7 +9,11 @@
 #     enable = true;
 #     settings.instance = {
 #       name = "kolorinko";
-#       sites = [ "obscurative" "rpcauthority" "wci" ];
+#       sites = [
+#         { type = "wikidot"; host = "obscurative"; }
+#         { type = "wikidot"; host = "rpcauthority"; }
+#         { type = "rufoundation"; host = "www.backroomswiki.ru"; }
+#       ];
 #     };
 #   };
 #
@@ -87,9 +91,35 @@ in
                   description = "Instance name (directory name under data_dir).";
                 };
                 sites = lib.mkOption {
-                  type = lib.types.listOf lib.types.str;
+                  type = lib.types.listOf (lib.types.submodule {
+                    freeformType = format.type;
+                    options = {
+                      type = lib.mkOption {
+                        type = lib.types.enum [ "wikidot" "rufoundation" ];
+                        description = ''
+                          Platform the site runs on. For "wikidot", `host`
+                          is the site slug (`obscurative` →
+                          obscurative.wikidot.com); for "rufoundation", it
+                          is the site hostname (keep the `www.` when the
+                          site uses it).
+                        '';
+                      };
+                      host = lib.mkOption {
+                        type = lib.types.str;
+                        description = "Site address on its platform — see `type`.";
+                      };
+                    };
+                  });
                   default = [ ];
-                  description = "Wikidot site slugs to archive.";
+                  description = ''
+                    Sites to archive, all in the same explicit shape, e.g.
+                    `{ type = "wikidot"; host = "obscurative"; }` or
+                    `{ type = "rufoundation"; host = "www.backroomswiki.ru"; api_key = "…"; }`.
+                    RuFoundation-only keys (freeform here, validated by the
+                    daemon): `api_key` — bot API key, optional, public sites
+                    archive fully without one; `name` — site directory name
+                    override (defaults to the host minus `www.`).
+                  '';
                 };
               };
             };
@@ -103,7 +133,11 @@ in
         data_dir = "/var/lib/evakuilo";
         instance = {
           name = "kolorinko";
-          sites = [ "obscurative" "rpcauthority" "wci" ];
+          sites = [
+            { type = "wikidot"; host = "obscurative"; }
+            { type = "wikidot"; host = "rpcauthority"; }
+            { type = "rufoundation"; host = "www.backroomswiki.ru"; }
+          ];
         };
         rate_limit_ms = 2000;
         zstd_level = 19;

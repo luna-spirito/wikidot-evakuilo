@@ -14,12 +14,13 @@ use serde::Deserialize;
 
 use crate::{
     blobs,
-    config::Config,
+    config::{Config, Platform},
     db::{self, Db, enqueue_on},
     http::{HostHealth, Wikidot},
     jobs,
     model::{ChangeEntry, FetchError, Slug},
     out, parsers,
+    rufoundation,
     wikidot::SiteApi,
 };
 
@@ -41,21 +42,21 @@ pub enum Outcome {
     Fail { error: String, permanent: bool },
 }
 
-fn complete(resched: Option<i64>, effects: Effects) -> Outcome {
+pub(crate) fn complete(resched: Option<i64>, effects: Effects) -> Outcome {
     Outcome::Complete { resched, effects }
 }
 
-fn complete_ephemeral(effects: Effects) -> Outcome {
+pub(crate) fn complete_ephemeral(effects: Effects) -> Outcome {
     Outcome::CompleteEphemeral { effects }
 }
 
-fn noop_effects() -> Effects {
+pub(crate) fn noop_effects() -> Effects {
     Box::new(|_| Ok(()))
 }
 
 /// Effects marking a files-row terminally `missing` (deleted upstream,
 /// dead/private origin). Terminal rows never re-attempt.
-fn missing_effects(path: String) -> Effects {
+pub(crate) fn missing_effects(path: String) -> Effects {
     Box::new(move |tx| {
         tx.execute(
             "INSERT INTO files(path, status, first_seen) VALUES(?1, 'missing', ?2)
@@ -66,29 +67,47 @@ fn missing_effects(path: String) -> Effects {
     })
 }
 
-fn fail_err(e: &FetchError) -> Outcome {
+pub(crate) fn fail_err(e: &FetchError) -> Outcome {
     Outcome::Fail {
         error: e.to_string(),
         permanent: e.permanent(),
     }
 }
 
-pub async fn run_job(db: &Db, cfg: &Config, wik: &Wikidot, site: &str, job: &db::Job) -> Outcome {
-    let api = SiteApi::new(wik, site, job.priority);
-    let out_dir = cfg.site_out(site);
+pub async fn run_job(
+    db: &Db,
+    cfg: &Config,
+    wik: &Wikidot,
+    site: &str,
+    platform: &Platform,
+    job: &db::Job,
+) -> Outcome {
+    // Platform-agnostic kinds run for every site; the rest dispatch on the
+    // platform the config resolved the site to.
     let result = match job.kind.as_str() {
-        jobs::kind::DISCOVER => discover(db, cfg, &api).await,
-        jobs::kind::PAGE_SYNC => page_sync(db, &api, job).await,
-        jobs::kind::REVISION_FETCH => revision_fetch(db, &api, out_dir, job).await,
-        jobs::kind::FILE_FETCH => file_fetch(db, &api, &out_dir, job).await,
-        jobs::kind::SHELL_SYNC => shell_sync(db, cfg, &api).await,
-        jobs::kind::THEME_CRAWL => theme_crawl(db, &api, &out_dir, job).await,
         jobs::kind::OUT_UPDATE => out_update(db, cfg, site).await,
         jobs::kind::BACKFILL => backfill(cfg),
-        other => Ok(Outcome::Fail {
-            error: format!("unknown job kind '{other}'"),
-            permanent: true,
-        }),
+        other => match platform {
+            Platform::Wikidot => {
+                let api = SiteApi::new(wik, site, job.priority);
+                let out_dir = cfg.site_out(site);
+                match other {
+                    jobs::kind::DISCOVER => discover(db, cfg, &api).await,
+                    jobs::kind::PAGE_SYNC => page_sync(db, &api, job).await,
+                    jobs::kind::REVISION_FETCH => revision_fetch(db, &api, out_dir, job).await,
+                    jobs::kind::FILE_FETCH => file_fetch(db, &api, &out_dir, job).await,
+                    jobs::kind::SHELL_SYNC => shell_sync(db, cfg, &api).await,
+                    jobs::kind::THEME_CRAWL => theme_crawl(db, &api, &out_dir, job).await,
+                    unknown => Ok(Outcome::Fail {
+                        error: format!("unknown job kind '{unknown}'"),
+                        permanent: true,
+                    }),
+                }
+            }
+            Platform::RuFoundation { host, api_key } => {
+                rufoundation::run_kind(db, cfg, wik, site, host, api_key, job).await
+            }
+        },
     };
     match result {
         Ok(outcome) => outcome,
