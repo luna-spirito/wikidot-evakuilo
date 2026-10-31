@@ -18,7 +18,7 @@ use crate::{
     db::{self, Db, enqueue_on},
     http::{HostHealth, Wikidot},
     jobs,
-    model::{ChangeEntry, FetchError, Slug},
+    model::{ChangeEntry, FetchError, FetchResult, Slug},
     out, parsers,
     rufoundation,
     wikidot::SiteApi,
@@ -97,7 +97,9 @@ pub async fn run_job(
                     jobs::kind::REVISION_FETCH => revision_fetch(db, &api, out_dir, job).await,
                     jobs::kind::FILE_FETCH => file_fetch(db, &api, &out_dir, job).await,
                     jobs::kind::SHELL_SYNC => shell_sync(db, cfg, &api).await,
-                    jobs::kind::THEME_CRAWL => theme_crawl(db, &api, &out_dir, job).await,
+                    jobs::kind::THEME_CRAWL => {
+                        theme_crawl(db, ThemeClient::Wikidot { api: &api }, &out_dir, job).await
+                    }
                     unknown => Ok(Outcome::Fail {
                         error: format!("unknown job kind '{unknown}'"),
                         permanent: true,
@@ -504,7 +506,51 @@ async fn file_fetch(
 // ── shell.sync: site display identity ──
 
 const SHELL_KEY: &str = "shell";
-const THEME_CRAWLED_KEY: &str = "theme.crawled";
+pub(crate) const THEME_CRAWLED_KEY: &str = "theme.crawled";
+
+/// The platform-specific pieces of the theme walker: a theme URL's
+/// files-row keys and how a public URL is fetched. The orchestration
+/// around it (BFS, blobs, files rows, marker) is platform-neutral.
+#[derive(Clone, Copy)]
+pub(crate) enum ThemeClient<'a> {
+    Wikidot { api: &'a SiteApi<'a> },
+    RuFoundation {
+        api: &'a crate::rufoundation::RuApi<'a>,
+        /// Site directory name (logs).
+        site: &'a str,
+    },
+}
+
+impl ThemeClient<'_> {
+    fn site(&self) -> &str {
+        match self {
+            ThemeClient::Wikidot { api } => &api.site,
+            ThemeClient::RuFoundation { site, .. } => site,
+        }
+    }
+
+    /// `(row key, canonical URL)` of one theme URL.
+    fn row_paths(&self, url: &str) -> (String, String) {
+        match self {
+            ThemeClient::Wikidot { api } => parsers::file_row_paths(&api.site, url),
+            ThemeClient::RuFoundation { api, .. } => api.file_row_paths(url),
+        }
+    }
+
+    fn host_health(&self, url: &str) -> HostHealth {
+        match self {
+            ThemeClient::Wikidot { api } => api.wik.host_health(url),
+            ThemeClient::RuFoundation { api, .. } => api.host_health(url),
+        }
+    }
+
+    async fn fetch(&self, url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
+        match self {
+            ThemeClient::Wikidot { api } => api.fetch_public(url).await,
+            ThemeClient::RuFoundation { api, .. } => api.fetch_file(url).await,
+        }
+    }
+}
 
 /// Refresh the site shell (title / subtitle / landing / theme roots) from
 /// the homepage. The homepage GET doubles as a CSRF warmup for a cold
@@ -564,14 +610,14 @@ async fn shell_sync(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome,
 }
 
 #[derive(serde::Serialize, Deserialize)]
-struct ThemeMarker {
+pub(crate) struct ThemeMarker {
     /// Crawled roots, sorted for byte-stability.
-    roots: Vec<String>,
+    pub(crate) roots: Vec<String>,
     /// Absolute URLs that yielded nothing (fetch error or 404). Non-empty
     /// keeps the crawl re-arming on every shell.sync — cheap, because
     /// everything already saved is read back from its blob, so a retry
     /// costs only the dead URL itself.
-    failed: Vec<String>,
+    pub(crate) failed: Vec<String>,
 }
 
 // ── theme.crawl: evacuate the theme @import / url() graph ──
@@ -580,9 +626,9 @@ struct ThemeMarker {
 /// (path, url, sha256, size, content_type).
 type SavedRow = (String, String, String, i64, Option<String>);
 
-async fn theme_crawl(
+pub(crate) async fn theme_crawl(
     db: &Db,
-    api: &SiteApi<'_>,
+    client: ThemeClient<'_>,
     out_dir: &std::path::Path,
     job: &db::Job,
 ) -> Result<Outcome, FetchError> {
@@ -606,8 +652,8 @@ async fn theme_crawl(
         let missing = missing.clone();
         let from_blob = from_blob.clone();
         async move {
-            let (path, row_url) = parsers::file_row_paths(&api.site, &url);
-            match api.wik.host_health(&url) {
+            let (path, row_url) = client.row_paths(&url);
+            match client.host_health(&url) {
                 // Origin proved gone: every URL on it answers the same
                 // error page — record missing, don't descend, no ticket.
                 HostHealth::Gone => {
@@ -634,7 +680,7 @@ async fn theme_crawl(
                     Err(_) => Some(crate::theme::Fetched::Binary),
                 };
             }
-            match api.fetch_public(&url).await {
+            match client.fetch(&url).await {
                 Ok((bytes, content_type)) => {
                     let size = bytes.len() as i64;
                     match blobs::write_blob(out_dir, &bytes) {
@@ -668,17 +714,17 @@ async fn theme_crawl(
     asset_urls.sort();
     asset_urls.dedup();
     for url in &asset_urls {
-        let (path, row_url) = parsers::file_row_paths(&api.site, url);
+        let (path, row_url) = client.row_paths(url);
         if let Ok(Some((status, _))) = db.file_row(&path)
             && status == "saved"
         {
             asset_ok += 1;
             continue;
         }
-        match api.wik.host_health(url) {
+        match client.host_health(url) {
             HostHealth::Gone => missing.lock().push(path),
             HostHealth::Unreachable => asset_failed.push(url.clone()),
-            HostHealth::Alive => match api.fetch_public(url).await {
+            HostHealth::Alive => match client.fetch(url).await {
                 Ok((bytes, content_type)) => {
                     let size = bytes.len() as i64;
                     match blobs::write_blob(out_dir, &bytes) {
@@ -710,7 +756,7 @@ async fn theme_crawl(
     let mut marker_failed: Vec<String> = outcome.failed.clone();
     marker_failed.extend(asset_failed);
     for u in &asset_urls {
-        let (path, _) = parsers::file_row_paths(&api.site, u);
+        let (path, _) = client.row_paths(u);
         if missing_paths.contains(&path) {
             marker_failed.push(u.clone());
         }
@@ -754,7 +800,7 @@ async fn theme_crawl(
         Ok(())
     });
     tracing::info!(
-        site = %api.site,
+        site = %client.site(),
         css = outcome.css.len(),
         read_from_blob,
         assets = asset_urls.len(),

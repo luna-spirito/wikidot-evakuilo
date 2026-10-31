@@ -256,14 +256,19 @@ impl<'a> RuApi<'a> {
 
     /// Whether a URL sits on the site's own host (www spelling included).
     fn is_own(&self, url: &str) -> bool {
-        fn bare(host: &str) -> &str {
-            host.strip_prefix("www.").unwrap_or(host)
-        }
-        match parsers::url_host(url) {
-            Some(h) => bare(&h) == bare(&self.host),
-            // Relative/junk paths ride the site's own origin.
-            None => true,
-        }
+        own_host(url, &self.host)
+    }
+
+    /// Shared host-health state (same limiter instance as the API calls).
+    pub(crate) fn host_health(&self, url: &str) -> HostHealth {
+        self.wik.host_health(url)
+    }
+
+    /// `(row key, canonical URL)` of a theme URL on this host — the same
+    /// normalization the wikitext-extraction side uses, so a page-attached
+    /// theme CSS converges on one row with its `file.fetch` twin.
+    pub(crate) fn file_row_paths(&self, url: &str) -> (String, String) {
+        parsers::file_row_paths_own(&self.host, url)
     }
 
     async fn retryable<T, F, Fut>(&self, label: &str, mut op: F) -> FetchResult<T>
@@ -335,7 +340,7 @@ impl<'a> RuApi<'a> {
     /// wikitext) never do — the API key must not leak to third parties.
     /// Redirects to the media domain are the server's business (public
     /// bytes; reqwest already strips the Authorization header on the hop).
-    async fn fetch_file(&self, url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
+    pub(crate) async fn fetch_file(&self, url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
         let bearer = if self.is_own(url) {
             self.bearer.as_deref()
         } else {
@@ -374,6 +379,76 @@ fn file_row_url(host: &str, slug: &str, name: &str) -> String {
     parsers::file_row_paths_own(host, &format!("https://{host}/local--files/{slug}/{name}")).0
 }
 
+/// Own-host check shared by the API client and theme-root planning (www
+/// spelling ignored; relative/junk paths ride the site's own origin).
+fn own_host(url: &str, host: &str) -> bool {
+    fn bare(host: &str) -> &str {
+        host.strip_prefix("www.").unwrap_or(host)
+    }
+    match parsers::url_host(url) {
+        Some(h) => bare(&h) == bare(host),
+        None => true,
+    }
+}
+
+/// Stylesheets every RuFoundation build ships — the platform, not the
+/// site's theme layer.
+fn platform_core_css(url: &str) -> bool {
+    let path = url::Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
+    path == "/-/static/wikidot-base.css"
+        || path == "/-/static/app.css"
+        || path.starts_with("/-/static/fontawesome/")
+}
+
+/// Custom-theme stylesheet roots scraped from the homepage's
+/// `<link rel="stylesheet">` tags. Platform core is dropped (fontawesome,
+/// `wikidot-base.css`, `app.css`); what remains is exactly the layer the
+/// site hangs on top: a page-attached CSS (`/local--files/{page}/{f}.css`
+/// — what both live sites use), a page-as-stylesheet
+/// (`/local--theme/{page}/style.css`), a deployment static
+/// (`scp-base.css` — on castopia.site a 54-byte `@import` stub the walker
+/// follows to the real page file), or a foreign CDN CSS. Own-host cache
+/// busters (`?v=…`) are stripped so rebuilds don't fragment rows/markers.
+fn plan_theme_roots(html: &str, host: &str) -> Vec<String> {
+    fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+        tag.split_whitespace().find_map(|tok| {
+            let (k, v) = tok.split_once('=')?;
+            (k == name).then(|| v.trim_matches(['"', '\'']))
+        })
+    }
+
+    let base = format!("https://{host}/");
+    let mut roots = Vec::new();
+    for segment in html.split('<').skip(1) {
+        let tag = &segment[..segment.find('>').unwrap_or(segment.len())];
+        // `link` followed by whitespace (not `linkx…`); the tag's inner
+        // text between attributes never contains '>'.
+        let Some(rest) = tag.strip_prefix("link") else { continue };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if attr(tag, "rel") != Some("stylesheet") {
+            continue;
+        }
+        let Some(href) = attr(tag, "href") else { continue };
+        let mut url = parsers::resolve_url(&base, href);
+        if own_host(&url, host) {
+            if let Some((without_query, _)) = url.split_once('?') {
+                url = without_query.to_string();
+            }
+            if platform_core_css(&url) {
+                continue;
+            }
+        }
+        if !roots.contains(&url) {
+            roots.push(url);
+        }
+    }
+    roots
+}
+
 // ── Job dispatch ──
 
 /// Execute one job for a RuFoundation site. Same contract as
@@ -395,9 +470,13 @@ pub async fn run_kind(
         jobs::kind::PAGE_SYNC => page_sync(db, &api, job).await,
         jobs::kind::REVISION_FETCH => revision_fetch(db, &api, job).await,
         jobs::kind::FILE_FETCH => file_fetch(db, &api, &out_dir, job).await,
-        jobs::kind::SHELL_SYNC => shell_sync(cfg, &api, site).await,
-        // Never enqueued for this platform (empty theme_roots); a stray
-        // row must not spin the queue.
+        jobs::kind::SHELL_SYNC => shell_sync(db, cfg, &api, site).await,
+        jobs::kind::THEME_CRAWL => {
+            let client = workers::ThemeClient::RuFoundation { api: &api, site };
+            workers::theme_crawl(db, client, &out_dir, job).await
+        }
+        // Wikidot-only kinds (theme rendering differs; no forum module
+        // here); a stray row must not spin the queue.
         other => Ok(Outcome::Fail {
             error: format!("job kind '{other}' is not runnable on a rufoundation site"),
             permanent: true,
@@ -751,28 +830,63 @@ async fn file_fetch(
 
 const SHELL_KEY: &str = "shell";
 
-async fn shell_sync(cfg: &Config, api: &RuApi<'_>, site: &str) -> Result<Outcome, FetchError> {
+async fn shell_sync(
+    db: &Db,
+    cfg: &Config,
+    api: &RuApi<'_>,
+    site: &str,
+) -> Result<Outcome, FetchError> {
     let html = api.fetch_homepage().await?;
+    let theme_roots = plan_theme_roots(&html, &api.host);
     let shell = out::Shell {
         title: html_title(&html),
-        // RuFoundation templates expose no subtitle; theme CSS lives in
-        // per-site FTML/component setup, not a crawlable import graph.
-        subtitle: String::new(),
+        // `#header h2` carries `{{ site_headline }}` — same shape as Wikidot.
+        subtitle: parsers::extract_site_subtitle(&html),
+        // No landing-slug hook in the templates (the homepage *is* it).
         landing: String::new(),
-        theme_roots: Vec::new(),
+        theme_roots: theme_roots.clone(),
     };
+
+    // Marker from the last *completed* crawl — same semantics as the
+    // Wikidot shell.sync: changed roots (or a crawl that ended with
+    // failures) enqueue `theme.crawl`; a site with no custom layer never
+    // crawls.
+    let needs_crawl = !theme_roots.is_empty()
+        && match db.meta_get(workers::THEME_CRAWLED_KEY).ok().flatten() {
+            None => true,
+            Some(m) => match serde_json::from_str::<workers::ThemeMarker>(&m) {
+                Ok(mk) => {
+                    let mut planned = theme_roots.clone();
+                    planned.sort();
+                    mk.roots != planned || !mk.failed.is_empty()
+                }
+                Err(_) => true,
+            },
+        };
+
+    // Derived file first (idempotent, byte-stable): a crash between the
+    // write and the meta commit just rewrites the same bytes next run.
     let out_dir = cfg.site_out(site);
     out::write_shell(&out_dir, &shell)
         .map_err(|e| FetchError::Http(format!("shell write: {e}")))?;
     let payload = serde_json::to_string(&shell)
         .map_err(|e| FetchError::Http(format!("shell encode: {e}")))?;
-    tracing::info!(site, title = %shell.title, "shell synced");
+    tracing::info!(
+        site,
+        title = %shell.title,
+        roots = theme_roots.len(),
+        needs_crawl,
+        "shell synced"
+    );
     let effects: Effects = Box::new(move |tx| {
         tx.execute(
             "INSERT INTO meta(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![SHELL_KEY, payload],
         )?;
+        if needs_crawl {
+            enqueue_on(tx, &[jobs::theme_crawl(&theme_roots)])?;
+        }
         Ok(())
     });
     Ok(workers::complete(Some(cfg.shell_interval_s), effects))
@@ -934,5 +1048,63 @@ mod tests {
         assert_eq!(html_title(html), "База данных Backrooms");
         assert_eq!(html_title("<TITLE>x</TITLE>"), "");
         assert_eq!(html_title("no title"), "");
+    }
+
+    #[test]
+    fn homepage_subtitle_is_extracted() {
+        // page.html renders the site headline exactly like Wikidot shells do:
+        // <div id="header">…<h2><span>{{ site_headline }}</span></h2>…
+        let html = r#"<body><div id="header">
+            <h1><a href="/"><span>Кастопия</span></a></h1>
+            <h2><span>Познай истину</span></h2>
+        </div></body>"#;
+        assert_eq!(parsers::extract_site_subtitle(html), "Познай истину");
+        assert_eq!(
+            parsers::extract_site_subtitle(r#"<div id="header"><h2></h2></div>"#),
+            ""
+        );
+        assert_eq!(parsers::extract_site_subtitle("no header"), "");
+    }
+
+    /// Real backroomswiki.ru head: the custom layer is one page-attached
+    /// css; the platform trio (fontawesome, wikidot-base, app.css) and the
+    /// favicon link drop out.
+    #[test]
+    fn theme_roots_drop_platform_core() {
+        let html = r#"
+<link rel="icon" type="image/x-icon" href="/local--files/-/favicon.ico">
+<link rel="stylesheet" type="text/css" href="/-/static/fontawesome/css/all.min.css?v=07a04d43">
+<link rel="stylesheet" type="text/css" href="/-/static/wikidot-base.css?v=d52432c4">
+<link rel="stylesheet" type="text/css" href="/local--files/main/theme.css">
+<link rel="stylesheet" type="text/css" href="/-/static/app.css?v=3df90649">
+"#;
+        assert_eq!(
+            plan_theme_roots(html, "www.backroomswiki.ru"),
+            vec!["https://www.backroomswiki.ru/local--files/main/theme.css"]
+        );
+    }
+
+    /// Real castopia.site head shapes: the deployment static stays a root
+    /// (its `?v=` cache buster stripped — the walker follows the stub's
+    /// `@import` to the real page file), foreign CDN css is kept, absolute
+    /// own-host hrefs and www/bare spellings fold correctly.
+    #[test]
+    fn theme_roots_keep_deployment_static_and_foreign_css() {
+        let html = r#"
+<link rel="stylesheet" type="text/css" href="/-/static/wikidot-base.css?v=1">
+<link rel="stylesheet" type="text/css" href="/-/static/scp-base.css?v=7fd3046a">
+<link rel="stylesheet" type="text/css" href="https://cdn.example.org/extra.css?family=x">
+<link rel="stylesheet" type="text/css" href="https://www.castopia.site/-/static/side-bar-redesign.css">
+"#;
+        assert_eq!(
+            plan_theme_roots(html, "castopia.site"),
+            vec![
+                "https://castopia.site/-/static/scp-base.css".to_string(),
+                "https://cdn.example.org/extra.css?family=x".to_string(),
+                "https://www.castopia.site/-/static/side-bar-redesign.css".to_string(),
+            ]
+        );
+        // No stylesheet links at all → no roots, theme.crawl never arms.
+        assert!(plan_theme_roots("<link rel=\"icon\" href=\"/x.ico\">", "x.test").is_empty());
     }
 }
