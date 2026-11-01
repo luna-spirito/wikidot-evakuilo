@@ -134,16 +134,17 @@ impl SiteSpec {
     }
 }
 
-/// Default RuFoundation directory name: host minus scheme/`www.`/trailing
-/// slash, lowercased.
+/// Default RuFoundation directory name: the configured host verbatim, minus
+/// scheme and trailing slash, lowercased. `www.` is part of the host's
+/// identity — stripping it would publish under a name nobody addresses the
+/// site by (the kolorinko registration uses the configured spelling).
 fn ru_dir_name(host: &str) -> String {
     let h = host.trim();
     let h = h
         .strip_prefix("https://")
         .or_else(|| h.strip_prefix("http://"))
         .unwrap_or(h);
-    let h = h.trim_end_matches('/');
-    h.strip_prefix("www.").unwrap_or(h).to_ascii_lowercase()
+    h.trim_end_matches('/').to_ascii_lowercase()
 }
 
 fn default_data_dir() -> PathBuf {
@@ -266,8 +267,8 @@ sites = ["backrooms-wiki"]
     }
 
     /// A RuFoundation site resolves its platform, key and default directory
-    /// name (host minus `www.`, TLD kept — `backroomswiki.ru` can never
-    /// collide with a Wikidot slug).
+    /// name (the configured host verbatim, `www.` kept — the publication
+    /// dir must match what kolorinko registers the site under).
     #[test]
     fn rufoundation_site_resolves_host_key_and_default_dir() {
         let cfg = load_str(
@@ -284,7 +285,7 @@ sites = [
         let resolved = cfg.resolved_sites().unwrap();
         assert_eq!(resolved.len(), 2);
         let (name, platform) = &resolved[1];
-        assert_eq!(name, "backroomswiki.ru");
+        assert_eq!(name, "www.backroomswiki.ru");
         let Platform::RuFoundation { host, api_key } = platform else {
             panic!("expected rufoundation platform");
         };

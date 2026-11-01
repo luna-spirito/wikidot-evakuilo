@@ -402,6 +402,39 @@ fn platform_core_css(url: &str) -> bool {
         || path.starts_with("/-/static/fontawesome/")
 }
 
+/// One attribute of an HTML tag text: `attr("a href=\"x\"", "href")` → `x`.
+fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    tag.split_whitespace().find_map(|tok| {
+        let (k, v) = tok.split_once('=')?;
+        (k == name).then(|| v.trim_matches(['"', '\'']))
+    })
+}
+
+/// `<link …>` tag texts — the inner text between `<` and the next `>`, with
+/// the tag name (`link` followed by whitespace, not `linkx…`) verified.
+fn link_tags(html: &str) -> impl Iterator<Item = &str> {
+    html.split('<').skip(1).filter_map(|segment| {
+        let tag = &segment[..segment.find('>').unwrap_or(segment.len())];
+        let rest = tag.strip_prefix("link")?;
+        rest.starts_with(char::is_whitespace).then_some(tag)
+    })
+}
+
+/// The landing page slug from the homepage's `<link rel="canonical">`: the
+/// homepage *serves* the landing page, so the canonical URL's last path
+/// segment is the landing slug (`https://…/main` → `main`).
+fn canonical_landing_slug(html: &str) -> Option<String> {
+    let href = link_tags(html)
+        .find(|t| attr(t, "rel") == Some("canonical"))
+        .and_then(|t| attr(t, "href"))?;
+    // Only the path counts: a bare origin (`https://x.test/`) names no slug.
+    let no_scheme = href.split_once("://").map_or(href, |(_, p)| p);
+    let (_, path) = no_scheme.split_once('/')?;
+    let slug = path.rsplit('/').find(|s| !s.is_empty())?;
+    let slug = slug.split(['?', '#']).next().unwrap_or("").trim();
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
 /// Custom-theme stylesheet roots scraped from the homepage's
 /// `<link rel="stylesheet">` tags. Platform core is dropped (fontawesome,
 /// `wikidot-base.css`, `app.css`); what remains is exactly the layer the
@@ -412,23 +445,9 @@ fn platform_core_css(url: &str) -> bool {
 /// follows to the real page file), or a foreign CDN CSS. Own-host cache
 /// busters (`?v=…`) are stripped so rebuilds don't fragment rows/markers.
 fn plan_theme_roots(html: &str, host: &str) -> Vec<String> {
-    fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-        tag.split_whitespace().find_map(|tok| {
-            let (k, v) = tok.split_once('=')?;
-            (k == name).then(|| v.trim_matches(['"', '\'']))
-        })
-    }
-
     let base = format!("https://{host}/");
     let mut roots = Vec::new();
-    for segment in html.split('<').skip(1) {
-        let tag = &segment[..segment.find('>').unwrap_or(segment.len())];
-        // `link` followed by whitespace (not `linkx…`); the tag's inner
-        // text between attributes never contains '>'.
-        let Some(rest) = tag.strip_prefix("link") else { continue };
-        if !rest.starts_with(char::is_whitespace) {
-            continue;
-        }
+    for tag in link_tags(html) {
         if attr(tag, "rel") != Some("stylesheet") {
             continue;
         }
@@ -842,8 +861,10 @@ async fn shell_sync(
         title: html_title(&html),
         // `#header h2` carries `{{ site_headline }}` — same shape as Wikidot.
         subtitle: parsers::extract_site_subtitle(&html),
-        // No landing-slug hook in the templates (the homepage *is* it).
-        landing: String::new(),
+        // The homepage *serves* the landing page, so its canonical URL
+        // names it (`/main`); without a canonical the landing stays unknown
+        // (kolorinko falls back to its `start` default).
+        landing: canonical_landing_slug(&html).unwrap_or_default(),
         theme_roots: theme_roots.clone(),
     };
 
@@ -874,6 +895,7 @@ async fn shell_sync(
     tracing::info!(
         site,
         title = %shell.title,
+        landing = %shell.landing,
         roots = theme_roots.len(),
         needs_crawl,
         "shell synced"
@@ -1106,5 +1128,27 @@ mod tests {
         );
         // No stylesheet links at all → no roots, theme.crawl never arms.
         assert!(plan_theme_roots("<link rel=\"icon\" href=\"/x.ico\">", "x.test").is_empty());
+    }
+
+    /// Real backroomswiki.ru head: the canonical names the page the
+    /// homepage serves. No canonical (or one without a path) → no landing.
+    #[test]
+    fn canonical_link_names_the_landing_slug() {
+        let html = r#"
+<link rel="icon" type="image/x-icon" href="/local--files/-/favicon.ico">
+<link rel="canonical" href="https://www.backroomswiki.ru/main">
+<link rel="stylesheet" type="text/css" href="/-/static/app.css?v=3df90649">
+"#;
+        assert_eq!(canonical_landing_slug(html).as_deref(), Some("main"));
+        assert_eq!(
+            canonical_landing_slug(r#"<link rel="canonical" href="https://x.test/blog:_start?d=1">"#)
+                .as_deref(),
+            Some("blog:_start")
+        );
+        assert_eq!(canonical_landing_slug("<title>no canonical</title>"), None);
+        assert_eq!(
+            canonical_landing_slug(r#"<link rel="canonical" href="https://x.test/">"#),
+            None
+        );
     }
 }
