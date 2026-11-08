@@ -469,12 +469,14 @@ impl RefOrigin {
     /// converges with its `:` twin.
     fn lift(&self, tail: &str) -> String {
         match self {
-            RefOrigin::Wikidot(site) => self
-                .row_key(&format!("http://{site}.wikidot.com/local--files/{tail}"))
-                .0,
-            RefOrigin::Host(host) => self
-                .row_key(&format!("https://{host}/local--files/{tail}"))
-                .0,
+            RefOrigin::Wikidot(site) => {
+                self.row_key(&format!("http://{site}.wikidot.com/local--files/{tail}"))
+                    .0
+            }
+            RefOrigin::Host(host) => {
+                self.row_key(&format!("https://{host}/local--files/{tail}"))
+                    .0
+            }
         }
     }
 }
@@ -521,7 +523,9 @@ fn absolute_base_before(prev: &str) -> Option<String> {
     let after = &prev[pos + 3..];
     let (host, rest) = after.split_once('/').unwrap_or((after, ""));
     let host_ok = !host.is_empty()
-        && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
     if !host_ok || !rest.is_empty() {
         return None;
     }
@@ -625,7 +629,11 @@ fn file_path_from_ref(site: &str, href: &str) -> Option<String> {
 /// main domain and pushed through the same canonicalization as absolute
 /// references, so a `%3A`-spelled slug converges with its `:` twin.
 fn own_file_url(site: &str, tail: &str) -> String {
-    file_row_paths(site, &format!("http://{site}.wikidot.com/local--files/{tail}")).0
+    file_row_paths(
+        site,
+        &format!("http://{site}.wikidot.com/local--files/{tail}"),
+    )
+    .0
 }
 
 fn take_until_stop(s: &str) -> String {
@@ -846,11 +854,15 @@ WIKIREQUEST.info.pageId = 1457213925;
     #[test]
     fn html_error_pages_classify_by_title() {
         assert_eq!(
-            html_error_page_kind("<html><head><title>The file does not exist</title></head><body>The file does not exist.</body></html>"),
+            html_error_page_kind(
+                "<html><head><title>The file does not exist</title></head><body>The file does not exist.</body></html>"
+            ),
             Some("file")
         );
         assert_eq!(
-            html_error_page_kind(r#"<html><head><title>The site does not exist</title></head><body></body></html>"#),
+            html_error_page_kind(
+                r#"<html><head><title>The site does not exist</title></head><body></body></html>"#
+            ),
             Some("site")
         );
         assert_eq!(
@@ -865,7 +877,9 @@ WIKIREQUEST.info.pageId = 1457213925;
         // A real HTML attachment (39 KB PHP file observed live): arbitrary
         // title, real content — must NOT be classified as an error page.
         assert_eq!(
-            html_error_page_kind(r#"<html oncontextmenu="return false"><head><title>RSC Institution</title></head><body>…real content…</body></html>"#),
+            html_error_page_kind(
+                r#"<html oncontextmenu="return false"><head><title>RSC Institution</title></head><body>…real content…</body></html>"#
+            ),
             None
         );
     }
@@ -877,9 +891,18 @@ WIKIREQUEST.info.pageId = 1457213925;
     fn canonical_urls_collapse_wikidot_host_spellings() {
         let key = |u: &str| file_row_paths("rpcauthority", u).0;
         let own = "http://rpcauthority.wikidot.com/local--files/rpc-1/a.jpg";
-        assert_eq!(key("http://rpcauthority.wikidot.com/local--files/rpc-1/a.jpg"), own);
-        assert_eq!(key("https://rpcauthority.wdfiles.com/local--files/rpc-1/a.jpg"), own);
-        assert_eq!(key("http://www.rpcauthority.wikidot.com/local--files/rpc-1/a.jpg#x"), own);
+        assert_eq!(
+            key("http://rpcauthority.wikidot.com/local--files/rpc-1/a.jpg"),
+            own
+        );
+        assert_eq!(
+            key("https://rpcauthority.wdfiles.com/local--files/rpc-1/a.jpg"),
+            own
+        );
+        assert_eq!(
+            key("http://www.rpcauthority.wikidot.com/local--files/rpc-1/a.jpg#x"),
+            own
+        );
         assert_eq!(
             key("http://RPCSANDBOX.wdfiles.com/local--files/component%3Atheme/x.css"),
             "http://rpcsandbox.wikidot.com/local--files/component:theme/x.css"
@@ -897,7 +920,10 @@ WIKIREQUEST.info.pageId = 1457213925;
         // provenance) with the fragment stripped.
         assert_eq!(
             file_row_paths("s", "http://x.test/a.css#frag"),
-            ("http://x.test/a.css".to_string(), "http://x.test/a.css".to_string())
+            (
+                "http://x.test/a.css".to_string(),
+                "http://x.test/a.css".to_string()
+            )
         );
         assert_eq!(
             file_row_paths("s", "https://s.wdfiles.com/local--code/theme/1.css").1,
@@ -944,9 +970,7 @@ WIKIREQUEST.info.pageId = 1457213925;
         let src = "[[=imagehttp://rpcauthority.wdfiles.com/local--files/two-sides/due.jpg]";
         assert_eq!(
             extract_file_links("rpcauthority", src),
-            vec![
-                "http://rpcauthority.wikidot.com/local--files/two-sides/due.jpg".to_string()
-            ]
+            vec!["http://rpcauthority.wikidot.com/local--files/two-sides/due.jpg".to_string()]
         );
         assert_eq!(absolute_base_before("[[=imagehttp://x.wdfiles.com/"), None);
     }
@@ -1006,11 +1030,9 @@ WIKIREQUEST.info.pageId = 1457213925;
             ]
         );
         // An absolute own-host spelling converges with the bare one.
-        let src = "a https://backroomswiki.ru/local--files/main/logo.png b /local--files/main/logo.png";
-        assert_eq!(
-            extract_file_links_origin(host, src).len(),
-            1
-        );
+        let src =
+            "a https://backroomswiki.ru/local--files/main/logo.png b /local--files/main/logo.png";
+        assert_eq!(extract_file_links_origin(host, src).len(), 1);
     }
 
     #[test]

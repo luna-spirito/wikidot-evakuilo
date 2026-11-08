@@ -40,7 +40,7 @@ use std::{
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -215,6 +215,33 @@ enum Migration {
     Repair(fn(&Transaction, &RepairCtx, &mut Vec<String>) -> Result<()>),
 }
 
+/// v8: remember the content hash of the archive a page's `packed_revs`
+/// describe. Existing rows get NULL: the next publication adopts the legacy
+/// `pages_by_id/...zst` (or repacks when it is gone) instead of forcing a
+/// full repack of every site.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE out_state ADD COLUMN archive_sha256 TEXT;
+"#;
+
+/// v8 is expressed as a repair rather than raw SQL so replaying migrations
+/// (the v6/v7 repair tests rewind `schema_version`) cannot hit a duplicate
+/// column. A real upgrade applies it exactly once.
+fn repair_out_state_archive_sha_v8(
+    tx: &Transaction,
+    _ctx: &RepairCtx,
+    _orphans: &mut Vec<String>,
+) -> Result<()> {
+    let has: i64 = tx.query_row(
+        "SELECT count(*) FROM pragma_table_info('out_state') WHERE name='archive_sha256'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has == 0 {
+        tx.execute_batch(SCHEMA_V8)?;
+    }
+    Ok(())
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration::Sql(SCHEMA_V1),
     Migration::Sql(SCHEMA_V2),
@@ -223,6 +250,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration::Sql(REARM_SHELL_SYNC_V5),
     Migration::Repair(repair_files_v6),
     Migration::Repair(repair_files_v7),
+    Migration::Repair(repair_out_state_archive_sha_v8),
 ];
 
 /// v6: file references mined from wikitext were defective twice over —
@@ -281,8 +309,9 @@ fn repair_files_v6(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
             "SELECT DISTINCT sha256 FROM files
               WHERE status='saved' AND content_type='text/html'",
         )?;
-        let shas: Vec<Option<String>> =
-            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let shas: Vec<Option<String>> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         orphans.extend(shas.into_iter().flatten());
     }
 
@@ -324,8 +353,9 @@ fn repair_files_v6(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
     let mut refs: HashSet<String> = HashSet::new();
     {
         let mut stmt = tx.prepare("SELECT content FROM revisions WHERE content IS NOT NULL")?;
-        let rows: Vec<String> =
-            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         for content in rows {
             for path in crate::parsers::extract_file_links(&ctx.site, &content) {
                 refs.insert(path);
@@ -353,7 +383,15 @@ fn repair_files_v6(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
-        let rank = |s: &str| if s == "saved" { 2 } else if s == "missing" { 1 } else { 0 };
+        let rank = |s: &str| {
+            if s == "saved" {
+                2
+            } else if s == "missing" {
+                1
+            } else {
+                0
+            }
+        };
         let mut groups: BTreeMap<String, Vec<(String, String, Option<String>)>> = BTreeMap::new();
         for (path, status, sha) in rows {
             groups
@@ -403,8 +441,9 @@ fn repair_files_v6(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
     // periodic backfill would do the same within its interval, this just
     // doesn't make the repair wait for it.
     let mut stmt = tx.prepare("SELECT path FROM files WHERE status='pending'")?;
-    let pending: Vec<String> =
-        stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let pending: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
     let jobs: Vec<NewJob> = pending
         .iter()
@@ -480,8 +519,9 @@ fn repair_files_v7(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
     let mut refs: HashSet<String> = HashSet::new();
     {
         let mut stmt = tx.prepare("SELECT content FROM revisions WHERE content IS NOT NULL")?;
-        let rows: Vec<String> =
-            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         for content in rows {
             for path in crate::parsers::extract_file_links(&ctx.site, &content) {
                 refs.insert(path);
@@ -497,8 +537,9 @@ fn repair_files_v7(tx: &Transaction, ctx: &RepairCtx, orphans: &mut Vec<String>)
     }
 
     let mut stmt = tx.prepare("SELECT path FROM files WHERE status='pending'")?;
-    let pending: Vec<String> =
-        stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let pending: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let jobs: Vec<NewJob> = pending
         .iter()
@@ -578,7 +619,28 @@ pub enum FailOutcome {
 // ── Database handle ──
 
 #[derive(Clone)]
-pub struct Db(Arc<Mutex<Connection>>);
+pub struct Db(Arc<Mutex<Connection>>, Arc<PathBuf>);
+
+/// A dedicated read-only connection with an open `BEGIN DEFERRED`
+/// transaction. Every query made through it sees one consistent SQLite
+/// snapshot, even while workers keep committing on the writer connection.
+/// Dropping it rolls the (read-only) transaction back.
+pub struct Snapshot {
+    conn: Connection,
+}
+
+impl Snapshot {
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // Best-effort: closing the connection rolls back anyway.
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+}
 
 /// Held by the daemon for its lifetime; dropping it releases the flock.
 pub struct DaemonLock(File);
@@ -624,17 +686,33 @@ impl Db {
             conn.pragma_update(None, "foreign_keys", "ON")
                 .context("enabling foreign_keys")?;
         }
-        conn.busy_timeout(std::time::Duration::from_secs(10))
+        conn.busy_timeout(Duration::from_secs(10))
             .context("setting busy_timeout")?;
-        let db = Db(Arc::new(Mutex::new(conn)));
+        let db = Db(Arc::new(Mutex::new(conn)), Arc::new(path.to_path_buf()));
         if !read_only {
-            db.migrate(&repair_ctx_for(path)).context("migrating schema")?;
+            db.migrate(&repair_ctx_for(path))
+                .context("migrating schema")?;
         }
         Ok(db)
     }
 
+    /// Open an independent read-only connection and start one deferred
+    /// transaction. Publication reads everything through this snapshot so a
+    /// commit landing mid-publish cannot mix generations.
+    pub fn read_snapshot(&self) -> Result<Snapshot> {
+        let path = self.1.as_ref();
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening {} read-only snapshot", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(10))
+            .context("setting snapshot busy_timeout")?;
+        conn.execute_batch("BEGIN DEFERRED")
+            .context("beginning read snapshot")?;
+        Ok(Snapshot { conn })
+    }
+
     /// Daemon entry point: open + take the site lock + recover stale jobs.
-    pub fn open_locked(path: &Path) -> Result<(Db, DaemonLock)> {        let lock_path = path
+    pub fn open_locked(path: &Path) -> Result<(Db, DaemonLock)> {
+        let lock_path = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("daemon.lock");
@@ -857,11 +935,7 @@ impl Db {
     /// `meta` table lookup.
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
         let conn = self.0.lock();
-        Ok(conn
-            .query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
-                r.get(0)
-            })
-            .optional()?)
+        meta_get_on(&conn, key)
     }
 
     /// Upsert a `meta` row.
@@ -985,104 +1059,35 @@ impl Db {
 
     // ── Publication (out/) ──
 
-    /// Every page, with its stored-revision count and how many revisions the
-    /// last publication packed. The publisher repacks when they differ.
-    pub fn pages_to_pack(&self) -> Result<Vec<PageToPack>> {
-        let conn = self.0.lock();
-        let mut stmt = conn.prepare(
-            "SELECT p.page_id, p.slug, p.title, p.tags,
-                    (SELECT count(*) FROM revisions r
-                      WHERE r.page_id=p.page_id AND r.content IS NOT NULL),
-                    COALESCE(o.packed_revs, 0)
-             FROM pages p LEFT JOIN out_state o ON o.page_id=p.page_id
-             ORDER BY p.page_id",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(PageToPack {
-                page_id: r.get(0)?,
-                slug: r.get(1)?,
-                title: r.get(2)?,
-                tags: parse_tags(&r.get::<_, String>(3)?),
-                stored_count: r.get(4)?,
-                packed_revs: r.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// All content-bearing revisions of a page, oldest first.
-    pub fn page_revisions_full(&self, page_id: i64) -> Result<Vec<FullRevision>> {
-        let conn = self.0.lock();
-        let mut stmt = conn.prepare(
-            "SELECT rev_no, rev_id, ts, author, content
-             FROM revisions WHERE page_id=?1 AND content IS NOT NULL
-             ORDER BY rev_no",
-        )?;
-        let rows = stmt.query_map(params![page_id], |r| {
-            Ok(FullRevision {
-                rev_no: r.get(0)?,
-                rev_id: r.get(1)?,
-                ts: r.get(2)?,
-                author: r.get(3)?,
-                content: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Record that `n` revisions are packed into the page's archive.
-    pub fn set_packed(&self, page_id: i64, n: i64) -> Result<()> {
-        let conn = self.0.lock();
-        conn.execute(
-            "INSERT INTO out_state(page_id, packed_revs, packed_at) VALUES(?1, ?2, ?3)
-             ON CONFLICT(page_id) DO UPDATE
-             SET packed_revs=excluded.packed_revs, packed_at=excluded.packed_at",
-            params![page_id, n, now()],
-        )?;
+    /// Update `out_state` for every page whose archive identity actually
+    /// changed. `packed_at` only moves when `(packed_revs, archive_sha256)`
+    /// does — an unchanged publication must not churn the cache.
+    pub fn update_out_state(&self, updates: &[OutStateUpdate]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.0.lock();
+        let tx = conn.transaction()?;
+        for update in updates {
+            tx.execute(
+                "INSERT INTO out_state(page_id, packed_revs, archive_sha256, packed_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(page_id) DO UPDATE SET
+                   packed_revs=excluded.packed_revs,
+                   archive_sha256=excluded.archive_sha256,
+                   packed_at=excluded.packed_at
+                 WHERE out_state.packed_revs <> excluded.packed_revs
+                    OR out_state.archive_sha256 IS NOT excluded.archive_sha256",
+                params![
+                    update.page_id,
+                    update.packed_revs,
+                    update.archive_sha256,
+                    now()
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
-    }
-
-    /// Rows for `pages.json`: identity + coverage per page, by page_id.
-    pub fn pages_manifest(&self) -> Result<Vec<PageManifestRow>> {
-        let conn = self.0.lock();
-        let mut stmt = conn.prepare(
-            "SELECT p.page_id, p.slug, p.title, p.tags,
-                    (SELECT count(*) FROM revisions r
-                      WHERE r.page_id=p.page_id AND r.content IS NOT NULL),
-                    (SELECT count(*) FROM revisions r WHERE r.page_id=p.page_id),
-                    COALESCE((SELECT max(rev_no) FROM revisions r
-                               WHERE r.page_id=p.page_id), 0)
-             FROM pages p ORDER BY p.page_id",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(PageManifestRow {
-                page_id: r.get(0)?,
-                slug: r.get(1)?,
-                title: r.get(2)?,
-                tags: parse_tags(&r.get::<_, String>(3)?),
-                stored_count: r.get(4)?,
-                known_count: r.get(5)?,
-                max_rev: r.get(6)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Rows for `files.json`: path, hash, size, status, media type — by path.
-    pub fn files_manifest(&self) -> Result<Vec<FileManifestRow>> {
-        let conn = self.0.lock();
-        let mut stmt = conn
-            .prepare("SELECT path, sha256, size, status, content_type FROM files ORDER BY path")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(FileManifestRow {
-                path: r.get(0)?,
-                sha256: r.get(1)?,
-                size: r.get(2)?,
-                status: r.get(3)?,
-                content_type: r.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // ── Observability (status) ──
@@ -1231,6 +1236,8 @@ pub struct SiteStats {
 
 // ── Publication rows ──
 
+/// One page as publication sees it: identity, coverage and the archive
+/// identity cached in `out_state`.
 #[derive(Debug, Clone)]
 pub struct PageToPack {
     pub page_id: i64,
@@ -1239,14 +1246,27 @@ pub struct PageToPack {
     pub tags: Vec<String>,
     /// Revisions with stored content.
     pub stored_count: i64,
+    /// All revisions, including meta-only ones.
+    pub known_count: i64,
+    pub max_rev: i64,
     /// Revisions the last publication packed (out_state).
     pub packed_revs: i64,
+    /// Content hash of the archive those revisions describe (out_state).
+    pub archive_sha256: Option<String>,
 }
 
 impl PageToPack {
     pub fn id_str(&self) -> String {
         self.page_id.to_string()
     }
+}
+
+/// A pending `out_state` write. Only pages whose cache drifted are sent.
+#[derive(Debug, Clone)]
+pub struct OutStateUpdate {
+    pub page_id: i64,
+    pub packed_revs: i64,
+    pub archive_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1259,29 +1279,89 @@ pub struct FullRevision {
 }
 
 #[derive(Debug, Clone)]
-pub struct PageManifestRow {
-    pub page_id: i64,
-    pub slug: String,
-    pub title: String,
-    pub tags: Vec<String>,
-    pub stored_count: i64,
-    pub known_count: i64,
-    pub max_rev: i64,
-}
-
-impl PageManifestRow {
-    pub fn id_str(&self) -> String {
-        self.page_id.to_string()
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct FileManifestRow {
     pub path: String,
     pub sha256: Option<String>,
     pub size: Option<i64>,
     pub status: String,
     pub content_type: Option<String>,
+}
+
+// ── Publication SQL (usable from a snapshot connection) ──
+
+/// One query for the whole page section: identity, stored/known coverage,
+/// max revision and the `out_state` cache, ordered by numeric page id.
+pub(crate) fn pages_for_publish_on(conn: &Connection) -> Result<Vec<PageToPack>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.page_id, p.slug, p.title, p.tags,
+                (SELECT count(*) FROM revisions r
+                  WHERE r.page_id=p.page_id AND r.content IS NOT NULL),
+                (SELECT count(*) FROM revisions r WHERE r.page_id=p.page_id),
+                COALESCE((SELECT max(rev_no) FROM revisions r
+                           WHERE r.page_id=p.page_id), 0),
+                COALESCE(o.packed_revs, 0),
+                o.archive_sha256
+         FROM pages p LEFT JOIN out_state o ON o.page_id=p.page_id
+         ORDER BY p.page_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PageToPack {
+            page_id: r.get(0)?,
+            slug: r.get(1)?,
+            title: r.get(2)?,
+            tags: parse_tags(&r.get::<_, String>(3)?),
+            stored_count: r.get(4)?,
+            known_count: r.get(5)?,
+            max_rev: r.get(6)?,
+            packed_revs: r.get(7)?,
+            archive_sha256: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// All content-bearing revisions of a page, oldest first.
+pub(crate) fn page_revisions_full_on(conn: &Connection, page_id: i64) -> Result<Vec<FullRevision>> {
+    let mut stmt = conn.prepare(
+        "SELECT rev_no, rev_id, ts, author, content
+         FROM revisions WHERE page_id=?1 AND content IS NOT NULL
+         ORDER BY rev_no",
+    )?;
+    let rows = stmt.query_map(params![page_id], |r| {
+        Ok(FullRevision {
+            rev_no: r.get(0)?,
+            rev_id: r.get(1)?,
+            ts: r.get(2)?,
+            author: r.get(3)?,
+            content: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Rows for the files section: path, hash, size, status, media type — by path.
+pub(crate) fn files_manifest_on(conn: &Connection) -> Result<Vec<FileManifestRow>> {
+    let mut stmt =
+        conn.prepare("SELECT path, sha256, size, status, content_type FROM files ORDER BY path")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FileManifestRow {
+            path: r.get(0)?,
+            sha256: r.get(1)?,
+            size: r.get(2)?,
+            status: r.get(3)?,
+            content_type: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// `meta` table lookup on an arbitrary connection.
+pub(crate) fn meta_get_on(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
+            r.get(0)
+        })
+        .optional()?)
 }
 
 fn parse_tags(json: &str) -> Vec<String> {
@@ -1706,7 +1786,8 @@ mod tests {
 
         const JUNK_SHA: &str = "eabe424dd70c56173c2cfcfe8ca6b328ef2077d6ce9b3243540148a2d76f20ab";
         const GOOD_SHA: &str = "00000000000000000000000000000000000000000000000000000000000000ff";
-        let junk_payload = serde_json::json!({ "path": "local--files/q/d.jpg|width=5" }).to_string();
+        let junk_payload =
+            serde_json::json!({ "path": "local--files/q/d.jpg|width=5" }).to_string();
         let dupe_payload =
             serde_json::json!({ "path": "http://sandbox.wdfiles.com/local--files/m/x.png" })
                 .to_string();
@@ -1763,8 +1844,10 @@ mod tests {
         // Blobs on disk: the junk one must be GC'd, the good one kept.
         let junk_blob = crate::blobs::blob_path(&ctx.out_dir, JUNK_SHA);
         let good_blob = crate::blobs::blob_path(&ctx.out_dir, GOOD_SHA);
-        for (blob, bytes) in [(junk_blob.clone(), b"<html>error page</html>".as_slice()), (good_blob.clone(), b"real png bytes")]
-        {
+        for (blob, bytes) in [
+            (junk_blob.clone(), b"<html>error page</html>".as_slice()),
+            (good_blob.clone(), b"real png bytes"),
+        ] {
             std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
             std::fs::write(&blob, bytes).unwrap();
         }
@@ -1776,7 +1859,13 @@ mod tests {
                 conn.query_row(
                     "SELECT status, sha256, content_type FROM files WHERE path=?1",
                     params![path],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .unwrap()
@@ -1810,13 +1899,21 @@ mod tests {
             // survives under the canonical key, the pending twin is gone.
             assert_eq!(
                 status("http://sandbox.wikidot.com/local--files/m/x.png"),
-                Some(("saved".into(), Some(GOOD_SHA.to_string()), Some("image/png".to_string())))
+                Some((
+                    "saved".into(),
+                    Some(GOOD_SHA.to_string()),
+                    Some("image/png".to_string())
+                ))
             );
             // The %3A-spelled legacy row converged with the ':'-spelled
             // reference: one saved row, decoded key.
             assert_eq!(
                 status("http://demo.wikidot.com/local--files/nav:side/discord.png"),
-                Some(("saved".into(), Some(GOOD_SHA.to_string()), Some("image/png".to_string())))
+                Some((
+                    "saved".into(),
+                    Some(GOOD_SHA.to_string()),
+                    Some("image/png".to_string())
+                ))
             );
             // The old keys are all gone…
             for gone in [
@@ -1945,5 +2042,63 @@ mod tests {
                 .unwrap();
             assert_eq!(armed.0, 2);
         });
+    }
+
+    /// v8 adds the archive hash cache without rewriting any existing row.
+    #[test]
+    fn v8_adds_archive_sha256_and_sets_schema_version() {
+        let (_d, db, _l) = site("v8");
+        let (version, has_column): (String, i64) = db
+            .with_conn(|conn| {
+                Ok::<_, rusqlite::Error>((
+                    conn.query_row(
+                        "SELECT value FROM meta WHERE key='schema_version'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT count(*) FROM pragma_table_info('out_state')
+                      WHERE name='archive_sha256'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len().to_string());
+        assert_eq!(has_column, 1);
+    }
+
+    /// A snapshot keeps seeing its own generation while the writer commits
+    /// new rows; a fresh snapshot sees them.
+    #[test]
+    fn read_snapshot_is_isolated_from_later_writes() {
+        let (_d, db, _l) = site("snapshot");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO pages(page_id, slug, discovered_at) VALUES(1, 'one', ?1)",
+                params![now()],
+            )
+            .unwrap();
+        });
+
+        let snap = db.read_snapshot().unwrap();
+        assert_eq!(pages_for_publish_on(snap.conn()).unwrap().len(), 1);
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO pages(page_id, slug, discovered_at) VALUES(2, 'two', ?1)",
+                params![now()],
+            )
+            .unwrap();
+        });
+
+        let during = pages_for_publish_on(snap.conn()).unwrap();
+        assert_eq!(during.len(), 1);
+        assert_eq!(during[0].page_id, 1);
+        drop(snap);
+
+        let fresh = db.read_snapshot().unwrap();
+        assert_eq!(pages_for_publish_on(fresh.conn()).unwrap().len(), 2);
     }
 }

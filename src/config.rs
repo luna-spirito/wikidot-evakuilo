@@ -189,9 +189,7 @@ impl Config {
                 bail!("rufoundation site '{name}' has an empty host");
             }
             if !seen.insert(name.clone()) {
-                bail!(
-                    "duplicate site directory '{name}': two sites would share one database"
-                );
+                bail!("duplicate site directory '{name}': two sites would share one database");
             }
         }
         Ok(cfg)
@@ -321,7 +319,10 @@ sites = [
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("duplicate site directory"), "{err}");
+        assert!(
+            err.to_string().contains("duplicate site directory"),
+            "{err}"
+        );
     }
 
     /// Typos fail loudly: an unknown `type` from `resolve`, an unknown
@@ -362,9 +363,6 @@ sites = [{ type = "wikidot", host = "x", api_key = "k" }]
 "#,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("rufoundation-only"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("rufoundation-only"), "{err}");
     }
 }

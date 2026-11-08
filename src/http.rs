@@ -91,7 +91,15 @@ impl Limiter {
     pub async fn acquire(&self, prio: i64) {
         let seq = NEXT_SEQ.fetch_add(1, Relaxed);
         let (done_tx, done_rx) = oneshot::channel();
-        if self.tx.send(Waiter { prio, seq, tx: done_tx }).is_ok() {
+        if self
+            .tx
+            .send(Waiter {
+                prio,
+                seq,
+                tx: done_tx,
+            })
+            .is_ok()
+        {
             let _ = done_rx.await;
         }
     }
@@ -310,14 +318,24 @@ impl Wikidot {
     /// Drop the site's CSRF token, in memory and on disk: the AJAX
     /// connector rejected it as stale, so the next call must re-bootstrap.
     pub fn forget_token(&self, site: &str) {
-        if self.jars.lock().get_mut(site).is_some_and(CookieJar::drop_token7) {
+        if self
+            .jars
+            .lock()
+            .get_mut(site)
+            .is_some_and(CookieJar::drop_token7)
+        {
             tracing::info!(site, "wikidot_token7 rejected as stale; will re-bootstrap");
             self.persist_cookies(site);
         }
     }
 
     /// Rate-limited GET. `url` must be absolute. Cookies in, cookies out.
-    pub async fn get(&self, site: &str, url: &str, prio: i64) -> Result<reqwest::Response, FetchError> {
+    pub async fn get(
+        &self,
+        site: &str,
+        url: &str,
+        prio: i64,
+    ) -> Result<reqwest::Response, FetchError> {
         self.limiter.acquire(prio).await;
         let mut req = self.http.get(url).timeout(self.timeout);
         if let Some(cookie) = self.cookie_header(site) {
@@ -420,7 +438,9 @@ impl Wikidot {
                 .ok_or_else(|| {
                     FetchError::Http(format!("redirect without Location: {}", resp.status()))
                 })?;
-            current = current.join(loc).map_err(|e| FetchError::Http(e.to_string()))?;
+            current = current
+                .join(loc)
+                .map_err(|e| FetchError::Http(e.to_string()))?;
         }
         Err(FetchError::Http(format!(
             "POST redirect chain exceeded {POST_REDIRECT_HOPS} hops at {current}"
@@ -627,8 +647,11 @@ mod tests {
     async fn attach_store_loads_and_persists_session() {
         let dir = tempfile::tempdir().unwrap();
         let (db, _lock) = Db::open_locked(&dir.path().join("site.db")).unwrap();
-        db.meta_set(COOKIE_KEY, r#"{"wikidot_token7":"t1","wikidot_session":"s1"}"#)
-            .unwrap();
+        db.meta_set(
+            COOKIE_KEY,
+            r#"{"wikidot_token7":"t1","wikidot_session":"s1"}"#,
+        )
+        .unwrap();
 
         let wik = Wikidot::new(50, 5).unwrap();
         wik.attach_store("demo", db.clone());
@@ -714,7 +737,9 @@ mod tests {
             let thread_log = Arc::clone(&log);
             std::thread::spawn(move || {
                 for response in responses {
-                    let Ok((mut sock, _)) = listener.accept() else { return };
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        return;
+                    };
                     let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
                     // Read until the head is complete, then honor
                     // Content-Length if one was sent.
@@ -834,12 +859,18 @@ mod tests {
     async fn host_health_marks_expire_and_never_downgrade() {
         let wik = Wikidot::new(1, 5).unwrap();
         // Unknown / unparseable URLs are alive.
-        assert_eq!(wik.host_health("http://dead.example/x.png"), HostHealth::Alive);
+        assert_eq!(
+            wik.host_health("http://dead.example/x.png"),
+            HostHealth::Alive
+        );
         assert_eq!(wik.host_health("relative/path"), HostHealth::Alive);
 
         // Gone marks the host for a long TTL.
         wik.mark_host_gone("http://dead.example/local--files/a/b.png");
-        assert_eq!(wik.host_health("http://dead.example/other.png"), HostHealth::Gone);
+        assert_eq!(
+            wik.host_health("http://dead.example/other.png"),
+            HostHealth::Gone
+        );
 
         // An unreachable mark never downgrades a gone one…
         let gone = *wik.host_marks.lock().get("dead.example").unwrap();
@@ -864,9 +895,7 @@ mod tests {
         assert_eq!(wik.scheme("demo"), "http");
         assert!(!wik.scheme_known("demo"));
         // In-module: simulate a learned response.
-        wik.schemes
-            .lock()
-            .insert("demo".into(), "https".into());
+        wik.schemes.lock().insert("demo".into(), "https".into());
         assert_eq!(wik.scheme("demo"), "https");
         assert!(wik.scheme_known("demo"));
         // Other sites are unaffected.

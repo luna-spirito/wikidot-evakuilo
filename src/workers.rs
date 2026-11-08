@@ -19,8 +19,7 @@ use crate::{
     http::{HostHealth, Wikidot},
     jobs,
     model::{ChangeEntry, FetchError, FetchResult, Slug},
-    out, parsers,
-    rufoundation,
+    out, parsers, rufoundation,
     wikidot::SiteApi,
 };
 
@@ -513,7 +512,9 @@ pub(crate) const THEME_CRAWLED_KEY: &str = "theme.crawled";
 /// around it (BFS, blobs, files rows, marker) is platform-neutral.
 #[derive(Clone, Copy)]
 pub(crate) enum ThemeClient<'a> {
-    Wikidot { api: &'a SiteApi<'a> },
+    Wikidot {
+        api: &'a SiteApi<'a>,
+    },
     RuFoundation {
         api: &'a crate::rufoundation::RuApi<'a>,
         /// Site directory name (logs).
@@ -559,7 +560,6 @@ impl ThemeClient<'_> {
 /// `theme.crawl`; a themeless site never crawls.
 async fn shell_sync(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome, FetchError> {
     let site = api.site.as_str();
-    let out_dir = cfg.site_out(site);
     let (_page_title, _tags, _page_id, html) = api.fetch_page(&Slug::parse("")).await?;
     let title = parsers::extract_site_title(&html);
     let subtitle = parsers::extract_site_subtitle(&html);
@@ -586,11 +586,6 @@ async fn shell_sync(db: &Db, cfg: &Config, api: &SiteApi<'_>) -> Result<Outcome,
                 Err(_) => true,
             },
         };
-
-    // Derived file first (idempotent, byte-stable): a crash between the
-    // write and the meta commit just rewrites the same bytes next run.
-    out::write_shell(&out_dir, &shell)
-        .map_err(|e| FetchError::Http(format!("shell write: {e}")))?;
 
     let payload = serde_json::to_string(&shell)
         .map_err(|e| FetchError::Http(format!("shell encode: {e}")))?;
@@ -830,7 +825,10 @@ async fn out_update(db: &Db, cfg: &Config, site: &str) -> Result<Outcome, FetchE
         site,
         packed = stats.pages_packed,
         skipped = stats.pages_skipped,
-        manifests = stats.manifests_rewritten,
+        reused = stats.pages_reused,
+        adopted = stats.pages_adopted,
+        objects = stats.objects_written,
+        head = stats.head_changed,
         "out/ published"
     );
     Ok(complete(Some(cfg.out_interval_s), noop_effects()))

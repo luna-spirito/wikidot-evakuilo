@@ -451,7 +451,9 @@ fn plan_theme_roots(html: &str, host: &str) -> Vec<String> {
         if attr(tag, "rel") != Some("stylesheet") {
             continue;
         }
-        let Some(href) = attr(tag, "href") else { continue };
+        let Some(href) = attr(tag, "href") else {
+            continue;
+        };
         let mut url = parsers::resolve_url(&base, href);
         if own_host(&url, host) {
             if let Some((without_query, _)) = url.split_once('?') {
@@ -885,11 +887,6 @@ async fn shell_sync(
             },
         };
 
-    // Derived file first (idempotent, byte-stable): a crash between the
-    // write and the meta commit just rewrites the same bytes next run.
-    let out_dir = cfg.site_out(site);
-    out::write_shell(&out_dir, &shell)
-        .map_err(|e| FetchError::Http(format!("shell write: {e}")))?;
     let payload = serde_json::to_string(&shell)
         .map_err(|e| FetchError::Http(format!("shell encode: {e}")))?;
     tracing::info!(
@@ -1141,8 +1138,10 @@ mod tests {
 "#;
         assert_eq!(canonical_landing_slug(html).as_deref(), Some("main"));
         assert_eq!(
-            canonical_landing_slug(r#"<link rel="canonical" href="https://x.test/blog:_start?d=1">"#)
-                .as_deref(),
+            canonical_landing_slug(
+                r#"<link rel="canonical" href="https://x.test/blog:_start?d=1">"#
+            )
+            .as_deref(),
             Some("blog:_start")
         );
         assert_eq!(canonical_landing_slug("<title>no canonical</title>"), None);

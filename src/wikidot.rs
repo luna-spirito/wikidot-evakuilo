@@ -38,7 +38,11 @@ impl<'a> SiteApi<'a> {
     }
 
     fn base(&self) -> String {
-        format!("{}://{}.wikidot.com", self.wik.scheme(&self.site), self.site)
+        format!(
+            "{}://{}.wikidot.com",
+            self.wik.scheme(&self.site),
+            self.site
+        )
     }
 
     // ── Generic retry wrapper (v1 `retryable`) ──
@@ -114,7 +118,10 @@ impl<'a> SiteApi<'a> {
         full.push(("callbackIndex", "0".into()));
         full.push(("wikidot_token7", token));
         let url = format!("{}/ajax-module-connector.php", self.base());
-        let resp = self.wik.post_form(&self.site, &url, &full, self.prio).await?;
+        let resp = self
+            .wik
+            .post_form(&self.site, &url, &full, self.prio)
+            .await?;
         let body = resp
             .text()
             .await
@@ -255,7 +262,10 @@ impl<'a> SiteApi<'a> {
     /// cookies ride along — this is the site's own namespace. The media
     /// type is the server's Content-Type sans parameters, or None when it
     /// sent nothing usable — callers fall back to sniffing.
-    pub async fn fetch_attachment(&self, path_or_url: &str) -> FetchResult<(Vec<u8>, Option<String>)> {
+    pub async fn fetch_attachment(
+        &self,
+        path_or_url: &str,
+    ) -> FetchResult<(Vec<u8>, Option<String>)> {
         let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
             path_or_url.to_string()
         } else {
@@ -344,7 +354,10 @@ mod tests {
 
     #[test]
     fn ajax_body_distinguishes_rejections() {
-        assert_eq!(parse_ajax_body(r#"{"status":"ok","body":"<b>x</b>"}"#).unwrap(), "<b>x</b>");
+        assert_eq!(
+            parse_ajax_body(r#"{"status":"ok","body":"<b>x</b>"}"#).unwrap(),
+            "<b>x</b>"
+        );
         assert_eq!(parse_ajax_body(r#"{"status":"ok"}"#).unwrap(), "");
         assert_eq!(
             parse_ajax_body(r#"{"status":"no_permission"}"#),

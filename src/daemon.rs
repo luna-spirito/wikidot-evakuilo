@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use tokio::sync::Semaphore;
 
-use crate::{config::Platform, config::Config, db::Db, http::Wikidot, jobs, workers};
+use crate::{config::Config, config::Platform, db::Db, http::Wikidot, jobs, workers};
 
 const SITE_CONCURRENCY: usize = 4;
 
@@ -45,7 +45,13 @@ pub async fn run(cfg: Config) -> Result<()> {
             wik.attach_store(&site, db.clone());
         }
         locks.push(lock);
-        let handle = tokio::spawn(site_worker(cfg.clone(), Arc::clone(&wik), db, site, platform));
+        let handle = tokio::spawn(site_worker(
+            cfg.clone(),
+            Arc::clone(&wik),
+            db,
+            site,
+            platform,
+        ));
         handles.push(handle);
     }
     if handles.is_empty() {

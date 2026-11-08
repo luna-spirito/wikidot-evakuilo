@@ -375,7 +375,6 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 rusqlite::params![serde_json::to_string(&shell)?],
             )?;
-            out::write_shell(&out_dir, &shell)?;
             stats.shell = true;
         }
 
@@ -398,8 +397,14 @@ fn import_site(cfg: &Config, from: &Path, site: &str) -> Result<ImportStats> {
     let pub_stats =
         out::publish(&db, site, &out_dir, cfg.zstd_level).context("publishing imported data")?;
     println!(
-        "      published: {} page archives ({} skipped), {} manifests",
-        pub_stats.pages_packed, pub_stats.pages_skipped, pub_stats.manifests_rewritten
+        "      published: {} page archives ({} skipped, {} reused, {} adopted), \
+         {} objects, head={}",
+        pub_stats.pages_packed,
+        pub_stats.pages_skipped,
+        pub_stats.pages_reused,
+        pub_stats.pages_adopted,
+        pub_stats.objects_written,
+        pub_stats.head_changed
     );
     Ok(stats)
 }

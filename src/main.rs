@@ -145,7 +145,11 @@ fn cmd_status() -> Result<()> {
                     println!("  DEAD {kind}: {err}");
                 }
             }
-            Err(_) => println!("\n{site} [{}]: no database yet ({})", platform.label(), db_path.display()),
+            Err(_) => println!(
+                "\n{site} [{}]: no database yet ({})",
+                platform.label(),
+                db_path.display()
+            ),
         }
     }
     Ok(())
