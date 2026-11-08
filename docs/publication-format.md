@@ -34,6 +34,14 @@ leaves harmless orphaned objects.
 read-only adoption input / rollback material and are not part of the new
 contract.
 
+## Format versions
+
+- **v3** adds the first/last content-bearing revision summary
+  (`created_by`/`created_at`/`updated_by`/`updated_at`) to page entries.
+  Readers that build catalog metadata can use it without decoding page
+  archives. The new fields are additive; old readers ignore them.
+- **v2** is the immutable content-addressed generation layout.
+
 ## Object schemas
 
 All hashed objects are compact JSON (`serde_json::to_vec`) plus a trailing
@@ -43,18 +51,22 @@ by SQL. Object hashes are computed over these exact bytes.
 ### Root
 
 ```json
-{"v":2,"site":"rpcauthority","pages":"<sha>","files":"<sha>","shell":"<sha>"}
+{"v":3,"site":"rpcauthority","pages":"<sha>","files":"<sha>","shell":"<sha>"}
 ```
 
 ### Pages section
 
 ```json
-{"v":2,"site":"rpcauthority","pages":[
+{"v":3,"site":"rpcauthority","pages":[
   {"id":"1234567890","slug":"some:page","title":"Title","tags":["a","b"],
    "revisions_stored":2,"revisions_known":3,"max_rev":3,
+   "created_by":"7","created_at":1700000001,
+   "updated_by":"7","updated_at":1700000002,
    "archive":"objects/archives/ab/cd/<sha>.zst","archive_sha256":"<sha>"},
   {"id":"9876543210","slug":"bare","title":"","tags":[],
    "revisions_stored":0,"revisions_known":1,"max_rev":1,
+   "created_by":null,"created_at":null,
+   "updated_by":null,"updated_at":null,
    "archive":null,"archive_sha256":null}
 ]}
 ```
@@ -63,10 +75,17 @@ One entry per page, including pages with no stored revisions, sorted by
 numeric page id. `tags` keep database order. `archive`/`archive_sha256` are
 `null` exactly when `revisions_stored == 0`.
 
+`created_by`/`created_at`/`updated_by`/`updated_at` summarize the first and
+last **content-bearing** revisions by `rev_no` (the same revisions packed
+into the archive). They are `null` exactly when there are no content-bearing
+revisions. The summary is part of the catalog so readers can build page
+metadata and satisfy `ListPages` selectors without opening page archives;
+the full revision history remains inside each page's archive.
+
 ### Files section
 
 ```json
-{"v":2,"site":"rpcauthority","files":[
+{"v":3,"site":"rpcauthority","files":[
   {"path":"http://site.wikidot.com/local--files/x/a.png","sha256":"<sha>",
    "size":12345,"content_type":"image/png","status":"saved",
    "blob":"files_ca/ab/cd/<rest>"}

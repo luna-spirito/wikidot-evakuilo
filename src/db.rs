@@ -1249,6 +1249,14 @@ pub struct PageToPack {
     /// All revisions, including meta-only ones.
     pub known_count: i64,
     pub max_rev: i64,
+    /// Author of the first content-bearing revision.
+    pub created_by: Option<String>,
+    /// Timestamp of the first content-bearing revision.
+    pub created_at: Option<i64>,
+    /// Author of the last content-bearing revision.
+    pub updated_by: Option<String>,
+    /// Timestamp of the last content-bearing revision.
+    pub updated_at: Option<i64>,
     /// Revisions the last publication packed (out_state).
     pub packed_revs: i64,
     /// Content hash of the archive those revisions describe (out_state).
@@ -1290,7 +1298,8 @@ pub struct FileManifestRow {
 // ── Publication SQL (usable from a snapshot connection) ──
 
 /// One query for the whole page section: identity, stored/known coverage,
-/// max revision and the `out_state` cache, ordered by numeric page id.
+/// max revision, the first/last content-bearing revision summary, and the
+/// `out_state` cache — ordered by numeric page id.
 pub(crate) fn pages_for_publish_on(conn: &Connection) -> Result<Vec<PageToPack>> {
     let mut stmt = conn.prepare(
         "SELECT p.page_id, p.slug, p.title, p.tags,
@@ -1299,6 +1308,18 @@ pub(crate) fn pages_for_publish_on(conn: &Connection) -> Result<Vec<PageToPack>>
                 (SELECT count(*) FROM revisions r WHERE r.page_id=p.page_id),
                 COALESCE((SELECT max(rev_no) FROM revisions r
                            WHERE r.page_id=p.page_id), 0),
+                (SELECT author FROM revisions r
+                  WHERE r.page_id=p.page_id AND r.content IS NOT NULL
+                  ORDER BY r.rev_no LIMIT 1),
+                (SELECT ts FROM revisions r
+                  WHERE r.page_id=p.page_id AND r.content IS NOT NULL
+                  ORDER BY r.rev_no LIMIT 1),
+                (SELECT author FROM revisions r
+                  WHERE r.page_id=p.page_id AND r.content IS NOT NULL
+                  ORDER BY r.rev_no DESC LIMIT 1),
+                (SELECT ts FROM revisions r
+                  WHERE r.page_id=p.page_id AND r.content IS NOT NULL
+                  ORDER BY r.rev_no DESC LIMIT 1),
                 COALESCE(o.packed_revs, 0),
                 o.archive_sha256
          FROM pages p LEFT JOIN out_state o ON o.page_id=p.page_id
@@ -1313,8 +1334,12 @@ pub(crate) fn pages_for_publish_on(conn: &Connection) -> Result<Vec<PageToPack>>
             stored_count: r.get(4)?,
             known_count: r.get(5)?,
             max_rev: r.get(6)?,
-            packed_revs: r.get(7)?,
-            archive_sha256: r.get(8)?,
+            created_by: r.get::<_, Option<i64>>(7)?.map(|a| a.to_string()),
+            created_at: r.get(8)?,
+            updated_by: r.get::<_, Option<i64>>(9)?.map(|a| a.to_string()),
+            updated_at: r.get(10)?,
+            packed_revs: r.get(11)?,
+            archive_sha256: r.get(12)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

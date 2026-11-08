@@ -101,6 +101,10 @@ pub fn publish(db: &Db, site: &str, out_dir: &Path, zstd_level: i32) -> Result<P
             revisions_stored: page.stored_count,
             revisions_known: page.known_count,
             max_rev: page.max_rev,
+            created_by: page.created_by.clone(),
+            created_at: page.created_at,
+            updated_by: page.updated_by.clone(),
+            updated_at: page.updated_at,
             archive,
             archive_sha256,
         });
@@ -456,7 +460,7 @@ mod tests {
 
         let (root_sha, root) = root_of(&out);
         assert_eq!(root_sha, sha);
-        assert_eq!(root.v, 2);
+        assert_eq!(root.v, 3);
         assert_eq!(root.site, "layout");
         for (kind, digest) in [
             (ObjectKind::Pages, &root.pages),
@@ -479,13 +483,17 @@ mod tests {
         );
 
         let pages = pages_of(&out, &root);
-        assert_eq!(pages.v, 2);
+        assert_eq!(pages.v, 3);
         assert_eq!(pages.site, "layout");
         assert_eq!(pages.pages.len(), 2);
         assert_eq!(pages.pages[0].id, "1234567890");
         assert_eq!(pages.pages[0].revisions_stored, 2);
         assert_eq!(pages.pages[0].revisions_known, 3);
         assert_eq!(pages.pages[0].max_rev, 3);
+        assert_eq!(pages.pages[0].created_by.as_deref(), Some("7"));
+        assert_eq!(pages.pages[0].created_at, Some(1_700_000_001));
+        assert_eq!(pages.pages[0].updated_by.as_deref(), Some("7"));
+        assert_eq!(pages.pages[0].updated_at, Some(1_700_000_002));
         assert_eq!(pages.pages[0].tags, ["a", "b"]);
         let archive = pages.pages[0].archive.as_deref().unwrap();
         let archive_sha = pages.pages[0].archive_sha256.as_deref().unwrap();
@@ -501,11 +509,15 @@ mod tests {
 
         assert_eq!(pages.pages[1].id, "9876543210");
         assert_eq!(pages.pages[1].revisions_stored, 0);
+        assert_eq!(pages.pages[1].created_by, None);
+        assert_eq!(pages.pages[1].created_at, None);
+        assert_eq!(pages.pages[1].updated_by, None);
+        assert_eq!(pages.pages[1].updated_at, None);
         assert!(pages.pages[1].archive.is_none());
         assert!(pages.pages[1].archive_sha256.is_none());
 
         let files = files_of(&out, &root);
-        assert_eq!(files.v, 2);
+        assert_eq!(files.v, 3);
         assert!(files.files.is_empty());
     }
 

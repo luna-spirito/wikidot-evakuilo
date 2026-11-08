@@ -2,15 +2,16 @@
 //!
 //! All objects are compact JSON plus a trailing newline. Field order comes
 //! from the struct declaration order, arrays are already sorted by SQL, and
-//! nothing timestamp-like or counter-like is serialized. The hash of an
-//! object is the hash of these exact bytes.
+//! nothing publication-clock-like (packed_at, local counters) is serialized.
+//! Database values such as revision timestamps are content and are included.
+//! The hash of an object is the hash of these exact bytes.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::store::is_sha256_lower_hex;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// `roots/<aa>/<bb>/<sha>.json` — the generation root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +52,18 @@ pub struct PageEntry {
     pub revisions_stored: i64,
     pub revisions_known: i64,
     pub max_rev: i64,
+    /// First content-bearing revision's author, if any.
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// First content-bearing revision's timestamp, if any.
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    /// Last content-bearing revision's author, if any.
+    #[serde(default)]
+    pub updated_by: Option<String>,
+    /// Last content-bearing revision's timestamp, if any.
+    #[serde(default)]
+    pub updated_at: Option<i64>,
     pub archive: Option<String>,
     pub archive_sha256: Option<String>,
 }
